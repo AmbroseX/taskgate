@@ -35,9 +35,9 @@
 
 **Purpose**: 契约先行,双后端一次实现全部 16 条行为契约(涵盖 US1~US6 的存储侧语义)。
 
-- [ ] T006 写 `deps.go`:依赖决策纯函数(计算唤醒/传播动作、pending_parents 递减不为负、提交时父已终态的初始状态判定)+ `deps_test.go` L1 覆盖
-- [ ] T007 写 `brokertest/suite.go`:`Run(t, factory)` + contracts 清单 16 条契约用例(RoundTrip/IdempotentID/ClaimMutex/BlockingDequeue/DelayedTask/AckFail/LeaseReap/StaleToken/RetryingReclaim/DepWake/CascadeCancel/CancelStates/CountsConsistency/ListFilter/RequeueNoCount/IllegalTransition),统一注入 fakeclock;此阶段只需编译通过
-- [ ] T008 写 `memorybroker/broker.go`(单 Mutex+Cond,语义参考实现)+ `memorybroker/broker_test.go` 一行接入 brokertest,**16 条全绿**
+- [X] T006 写 `deps.go`:依赖决策纯函数(计算唤醒/传播动作、pending_parents 递减不为负、提交时父已终态的初始状态判定)+ `deps_test.go` L1 覆盖
+- [X] T007 写 `brokertest/suite.go`:`Run(t, factory)` + contracts 清单 16 条契约用例(RoundTrip/IdempotentID/ClaimMutex/BlockingDequeue/DelayedTask/AckFail/LeaseReap/StaleToken/RetryingReclaim/DepWake/CascadeCancel/CancelStates/CountsConsistency/ListFilter/RequeueNoCount/IllegalTransition),统一注入 fakeclock;此阶段只需编译通过
+- [X] T008 写 `memorybroker/broker.go`(单 Mutex+Cond,语义参考实现)+ `memorybroker/broker_test.go` 一行接入 brokertest,**16 条全绿**
 - [ ] T009 写 `sqlitebroker/broker.go` + `sqlitebroker/schema.sql`(go:embed,DDL 照 data-model.md 第 3 节,WAL+busy_timeout,BEGIN IMMEDIATE 子查询认领,终态+唤醒同事务)+ `sqlitebroker/broker_test.go` 接入 brokertest,**16 条全绿**(依赖 T008 先定语义基准,但文件独立可并行开工)
 
 **Checkpoint**: `go test ./brokertest/... ./memorybroker/... ./sqlitebroker/... -race` 全绿——存储层全部行为契约成立,这是整个 M1 的地基。
