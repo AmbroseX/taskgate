@@ -140,7 +140,7 @@
 - [X] T029 [P] 写 `examples/llm/main.go` 三级流水线示例(memory 后端,可 go run)
 - [X] T030 [P] 导出符号 godoc 注释补全 + README.md(简介/快速开始/与方案文档链接)
 - [X] T031 运行 quickstart.md 验收检查点全表:`go build ./...`、`go vet ./...`、`go test ./... -race`、覆盖率(核心 ≥85%/broker ≥80%,不足则补测试)、宪法取证 grep
-- [ ] T032 将完成情况回写 docs/plans/(YYYY-MM-DD-M1完成记录.md)并 git 提交
+- [X] T032 将完成情况回写 docs/plans/(YYYY-MM-DD-M1完成记录.md)并 git 提交
 
 ---
 
