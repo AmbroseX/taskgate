@@ -20,8 +20,8 @@
 
 **Purpose**: QueueLimiter/LimiterProvider 定型 + scheduler 装配点,单机后端零回归。
 
-- [ ] T101 根包:broker.go 加 `LimiterProvider` 接口、limiter.go 抽 `QueueLimiter` 接口并把 `limiter` 改名 `localLimiter` 实现它(research 第 5 节签名);godoc 写明能力接口的语义与"上层不特判后端"的关系
-- [ ] T102 scheduler.go 装配点:构造限流器时先断言 `LimiterProvider`,无则 `newLocalLimiter`;**全量 M1 测试回归零失败**(`go test ./... -race -count=1`)
+- [x] T101 根包:broker.go 加 `LimiterProvider` 接口、limiter.go 抽 `QueueLimiter` 接口并把 `limiter` 改名 `localLimiter` 实现它(research 第 5 节签名);godoc 写明能力接口的语义与"上层不特判后端"的关系
+- [x] T102 scheduler.go 装配点:构造限流器时先断言 `LimiterProvider`,无则 `newLocalLimiter`;**全量 M1 测试回归零失败**(`go test ./... -race -count=1`)
 
 **Checkpoint**: 单机行为与 M1 完全一致,接口就绪。
 

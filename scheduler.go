@@ -143,12 +143,29 @@ func (s *scheduler) run(ctx context.Context) error {
 	s.started = true
 	s.stopClaims = stopClaims
 	s.runExited = runExited
-	limiters := make(map[string]*limiter, len(queues))
+	// 构造每队列限流器:后端实现 LimiterProvider(可选能力接口)就用后端给的
+	// 跨进程共享限流器,否则退回进程内限流——memory/sqlite 走后一条路,行为与 M1 一致。
+	// 放在锁内做:构造失败时状态还没对外暴露,回滚后 Shutdown/再次 Run 都不受影响。
+	limiters := make(map[string]QueueLimiter, len(queues))
+	lp, hasLP := s.gate.broker.(LimiterProvider)
 	for name, qc := range queues {
 		if _, ok := s.running[name]; !ok {
 			s.running[name] = &atomic.Int64{}
 		}
-		limiters[name] = newLimiter(qc.Workers, qc.RPS, qc.Burst)
+		if hasLP {
+			ql, lerr := lp.QueueLimiter(name, qc)
+			if lerr != nil {
+				// 构造失败:回滚启动标记,Run 返回该错误,之后还能重新 Run。
+				s.started = false
+				s.stopClaims = nil
+				s.runExited = nil
+				s.mu.Unlock()
+				return lerr
+			}
+			limiters[name] = ql
+			continue
+		}
+		limiters[name] = newLocalLimiter(qc.Workers, qc.RPS, qc.Burst)
 	}
 	s.mu.Unlock()
 	ctx = runCtx
@@ -231,21 +248,21 @@ func (s *scheduler) shutdown(ctx context.Context) error {
 // 为什么先占槽:令牌桶按时间匀速放行,拿了令牌却没槽跑,等槽期间这个令牌等于白烧
 // (启动配额被浪费),Workers 满载时实际吞吐会低于配置的 RPS;
 // 先占槽保证"每个令牌都花在马上能跑的任务上"。
-func (s *scheduler) claimLoop(ctx context.Context, queue string, lim *limiter, workerWG *sync.WaitGroup, ttl time.Duration) {
+func (s *scheduler) claimLoop(ctx context.Context, queue string, lim QueueLimiter, workerWG *sync.WaitGroup, ttl time.Duration) {
 	cnt := s.running[queue]
 	for {
-		if err := lim.acquireSlot(ctx); err != nil {
+		if err := lim.AcquireSlot(ctx); err != nil {
 			return // ctx 取消,停止认领
 		}
-		if err := lim.waitToken(ctx); err != nil {
-			lim.releaseSlot()
+		if err := lim.WaitToken(ctx); err != nil {
+			lim.ReleaseSlot()
 			return
 		}
 		// 先拿令牌再 Dequeue:队列空闲期会预烧至多 1 个令牌等在 Dequeue 上,
 		// Dequeue 出错也白烧 1 个,这点偏差在 SC-001 的 ±1 容差内。
 		t, err := s.gate.broker.Dequeue(ctx, []string{queue})
 		if err != nil {
-			lim.releaseSlot()
+			lim.ReleaseSlot()
 			if ctx.Err() != nil {
 				return
 			}
@@ -258,7 +275,7 @@ func (s *scheduler) claimLoop(ctx context.Context, queue string, lim *limiter, w
 		go func() {
 			defer func() {
 				cnt.Add(-1)
-				lim.releaseSlot()
+				lim.ReleaseSlot()
 				workerWG.Done()
 			}()
 			s.execute(t, ttl)
