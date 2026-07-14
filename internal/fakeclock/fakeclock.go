@@ -77,6 +77,15 @@ func (c *Clock) NewTicker(d time.Duration) taskgate.Ticker {
 	return tk
 }
 
+// TickerCount 当前注册的 ticker 数(含已 Stop 未清理的)。给测试做同步用:
+// 被测代码的 ticker 常由后台 goroutine 异步创建,先等它挂上再 Advance,
+// 否则拨钟发生在注册之前,那一格滴答就永远丢了(假时钟只在 Advance 时发滴答)。
+func (c *Clock) TickerCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.tickers)
+}
+
 // Advance 把时间往前拨 d,唤醒所有到点的等待者,给到点的 ticker 补上滴答。
 func (c *Clock) Advance(d time.Duration) {
 	c.mu.Lock()

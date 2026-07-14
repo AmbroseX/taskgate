@@ -149,6 +149,17 @@ func TestLimiterRenewKeepsSlot(t *testing.T) {
 	t.Cleanup(func() { _ = rdb.Close() })
 	semKey := "tg:sem:q"
 
+	// 续期 ticker 是 AcquireSlot 返回后由后台 goroutine 异步注册的:
+	// 必须先等它挂上假时钟再 Advance,否则拨钟发生在注册之前,
+	// 那一格滴答永远丢失、续期永远不会发生(机器繁忙时真出现过)。
+	regDeadline := time.Now().Add(5 * time.Second)
+	for clk.TickerCount() == 0 {
+		if time.Now().After(regDeadline) {
+			t.Fatal("续期 ticker 迟迟没有注册到假时钟上")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	for step := 0; step < 4; step++ {
 		clk.Advance(time.Second) // 续期 ticker 周期 = TTL/3 = 1s,每步触发一次
 		want := float64(clk.Now().Add(ttl).UnixMilli())

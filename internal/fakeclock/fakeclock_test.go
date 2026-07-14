@@ -58,8 +58,14 @@ func TestAdvanceExactBoundary(t *testing.T) {
 // (收不动就丢,与 time.Ticker 一致);内部 next 必须补齐到位,后续周期不漂移。
 func TestTickerCatchUp(t *testing.T) {
 	c := New(start)
+	if n := c.TickerCount(); n != 0 {
+		t.Fatalf("新时钟不该有 ticker,实际 %d", n)
+	}
 	tk := c.NewTicker(time.Second)
 	defer tk.Stop()
+	if n := c.TickerCount(); n != 1 {
+		t.Fatalf("注册一个 ticker 后 TickerCount 应为 1,实际 %d", n)
+	}
 
 	c.Advance(3 * time.Second) // 跨 3 个周期
 	select {

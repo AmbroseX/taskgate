@@ -16,6 +16,8 @@ package taskgate_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -97,7 +99,10 @@ func TestMultiprocHelper(t *testing.T) {
 	}
 
 	// 执行记录客户端:走独立连接,不借道 broker(broker 不导出它的客户端,也不该导出)。
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	// MaxRetries=-1 关掉 go-redis 的自动重试:INCR/DECR 不幂等,机器高负载下
+	// 一次"响应丢失+自动重试"就会把观测计数悄悄写两遍,制造假的并发超限/重复执行;
+	// 关掉后这类故障表现为 handler 报错走任务重试,INCR/DECR 整对重来,观测不失真。
+	rdb := redis.NewClient(&redis.Options{Addr: addr, MaxRetries: -1})
 	defer func() { _ = rdb.Close() }()
 
 	sentinel := os.Getenv("TASKGATE_MP_SENTINEL")
@@ -140,28 +145,35 @@ func TestMultiprocHelper(t *testing.T) {
 		}
 		// 收工监视:全局 completed 达标后 Shutdown,让 Run 正常返回、进程退出码 0。
 		// 两个 worker 各自监视各自退,谁先看到都行,不用进程间协商。
-		go func() {
-			for {
-				counts, cerr := b.Counts(context.Background())
-				if cerr == nil {
-					var done int64
-					for _, byStatus := range counts {
-						done += byStatus[taskgate.StatusCompleted]
-					}
-					if done >= int64(total) {
-						sdCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-						defer cancel()
-						_ = g.Shutdown(sdCtx)
-						return
-					}
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-		}()
+		shutdownWhenCounted(g, b, total, taskgate.StatusCompleted)
 	}
 	if err := g.Run(context.Background()); err != nil {
 		t.Fatalf("子进程 Run 返回错误: %v", err) // stall 模式跑到被杀,走不到这里
 	}
+}
+
+// shutdownWhenCounted 后台监视:全局 status 状态的任务数(跨 Type 求和)达到 total 后
+// Shutdown,让 Run 正常返回、子进程以退出码 0 收场。各 worker 各自监视各自退,
+// 谁先看到都行,不用进程间协商。
+func shutdownWhenCounted(g *taskgate.Gate, b taskgate.Broker, total int, status taskgate.Status) {
+	go func() {
+		for {
+			counts, cerr := b.Counts(context.Background())
+			if cerr == nil {
+				var done int64
+				for _, byStatus := range counts {
+					done += byStatus[status]
+				}
+				if done >= int64(total) {
+					sdCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					_ = g.Shutdown(sdCtx)
+					return
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
 }
 
 // workerProc 一个子进程 worker 的句柄:输出攒在缓冲区,失败时才打出来。
@@ -170,16 +182,23 @@ type workerProc struct {
 	out bytes.Buffer
 }
 
-// spawnWorker exec 自身测试二进制拉起子进程 worker,extra 放模式相关的环境变量。
-// Cleanup 兜底 Kill,不留孤儿进程。
+// spawnWorker exec 自身测试二进制拉起子进程 worker(跑 TestMultiprocHelper),
+// extra 放模式相关的环境变量。
 func spawnWorker(t *testing.T, addr string, ttl time.Duration, extra ...string) *workerProc {
+	t.Helper()
+	return spawnHelper(t, "TestMultiprocHelper", addr, ttl, extra...)
+}
+
+// spawnHelper exec 自身测试二进制拉起指定的 helper 测试当子进程 worker。
+// Cleanup 兜底 Kill,不留孤儿进程。
+func spawnHelper(t *testing.T, helper, addr string, ttl time.Duration, extra ...string) *workerProc {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("拿不到测试二进制路径: %v", err)
 	}
 	w := &workerProc{}
-	w.cmd = exec.Command(exe, "-test.run=^TestMultiprocHelper$", "-test.timeout=2m")
+	w.cmd = exec.Command(exe, "-test.run=^"+helper+"$", "-test.timeout=2m")
 	w.cmd.Env = append(os.Environ(),
 		"TASKGATE_MP_HELPER=1",
 		"TASKGATE_MP_ADDR="+addr,
@@ -568,4 +587,292 @@ func TestRedisDisconnectRecovery(t *testing.T) {
 			t.Fatalf("任务 %s 最终应 completed,实际 %s", id, task.Status)
 		}
 	}
+}
+
+// ---- T113 跨进程流水线与跨进程取消(spec US4 / SC-004) ----
+
+// 跨进程流水线的公共约定:两条队列 ocr / extract(队列名 = 任务类型名),
+// 生产者和两个消费者进程共用同一份双队列 Config(文档约定:共享 Config),
+// 但进程 A 只 Handle ocr、进程 B 只 Handle extract——scheduler 只消费
+// "注册过 handler 的 Type 对应的队列",所以 A 绝不会碰 extract 的任务,反之亦然。
+const (
+	ppOcrQueue     = "ocr"
+	ppExtractQueue = "extract"
+)
+
+// ppConfig 跨进程流水线统一的 Gate 配置(双队列写全,谁消费哪条由 Handle 决定)。
+func ppConfig(b taskgate.Broker, ttl time.Duration) taskgate.Config {
+	return taskgate.Config{
+		Broker: b,
+		Queues: map[string]taskgate.QueueConfig{
+			ppOcrQueue:     {Workers: 4, LeaseTTL: taskgate.Duration(ttl)},
+			ppExtractQueue: {Workers: 4, LeaseTTL: taskgate.Duration(ttl)},
+		},
+	}
+}
+
+// TestMultiprocPipelineHelper 跨进程流水线的子进程 worker,按 TASKGATE_MP_ROLE 分工:
+//   - "ocr":只 Handle ocr,handler 从 Payload 里读页号 n,产出 {"text":"page-n"};
+//   - "extract":只 Handle extract,handler 逐个 Get 父任务、把父的 Result 原样拼进
+//     自己的 Result——断言"子任务确实读到了另一个进程写下的父结果"就靠这份拼接。
+//
+// 全局 completed 达到 TASKGATE_MP_TOTAL 后 Shutdown 正常退出(退出码 0)。
+func TestMultiprocPipelineHelper(t *testing.T) {
+	if os.Getenv("TASKGATE_MP_HELPER") != "1" {
+		t.Skip("仅作为跨进程流水线专项的子进程 worker 运行")
+	}
+	addr := os.Getenv("TASKGATE_MP_ADDR")
+	role := os.Getenv("TASKGATE_MP_ROLE")
+	ttl, err := time.ParseDuration(os.Getenv("TASKGATE_MP_TTL"))
+	if addr == "" || err != nil {
+		t.Fatalf("子进程环境变量不全: addr=%q ttl=%v", addr, err)
+	}
+	total, err := strconv.Atoi(os.Getenv("TASKGATE_MP_TOTAL"))
+	if err != nil || total <= 0 {
+		t.Fatalf("TASKGATE_MP_TOTAL 无效: %v", err)
+	}
+
+	b, err := redisbroker.New(redisbroker.Options{Addr: addr})
+	if err != nil {
+		t.Fatalf("子进程连 Redis(%s) 失败: %v", addr, err)
+	}
+	defer func() { _ = b.Close() }()
+	g, err := taskgate.New(ppConfig(b, ttl))
+	if err != nil {
+		t.Fatalf("子进程 New 失败: %v", err)
+	}
+
+	switch role {
+	case "ocr":
+		g.Handle(ppOcrQueue, func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			var in struct {
+				N int `json:"n"`
+			}
+			if err := json.Unmarshal(task.Payload, &in); err != nil {
+				return nil, err
+			}
+			return []byte(fmt.Sprintf(`{"text":"page-%d"}`, in.N)), nil
+		})
+	case "extract":
+		g.Handle(ppExtractQueue, func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			// 依赖唤醒的合同保证走到这里时父必然已终态;FailFast 下还必然是 completed。
+			parts := make([]string, 0, len(task.DependsOn))
+			for _, pid := range task.DependsOn {
+				parent, gerr := g.Get(ctx, pid)
+				if gerr != nil {
+					return nil, gerr
+				}
+				if parent.Status != taskgate.StatusCompleted {
+					return nil, fmt.Errorf("父任务 %s 未完成就唤醒了子任务: %s", pid, parent.Status)
+				}
+				parts = append(parts, string(parent.Result))
+			}
+			return []byte(`{"merged":[` + strings.Join(parts, ",") + `]}`), nil
+		})
+	default:
+		t.Fatalf("TASKGATE_MP_ROLE 无效: %q", role)
+	}
+
+	shutdownWhenCounted(g, b, total, taskgate.StatusCompleted)
+	if err := g.Run(context.Background()); err != nil {
+		t.Fatalf("子进程 Run 返回错误: %v", err)
+	}
+}
+
+// TestMultiprocPipeline 跨进程流水线(T113-①,spec US4 场景 1/3):
+// 进程 A 只消费 ocr 队列、进程 B 只消费 extract 队列,父进程提交 5 条 ocr→extract
+// 依赖链。断言:全部 completed(A 完成父任务能跨进程唤醒 B 阻塞等待中的子任务),
+// 且每个 extract 任务的 Result 里拼进了对应 ocr 任务的产出(跨进程 Get 父 Result)。
+func TestMultiprocPipeline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short 模式跳过多进程专项")
+	}
+	mr := miniredis.RunT(t)
+
+	const chains = 5
+	const total = chains * 2     // ocr 5 + extract 5
+	const ttl = 10 * time.Second // 租约给足,正常路径不许出现误过期重跑
+
+	// 父进程只当生产者:Submit 不 Handle 不 Run。
+	pb, err := redisbroker.New(redisbroker.Options{Addr: mr.Addr()})
+	if err != nil {
+		t.Fatalf("生产者连 Redis 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = pb.Close() })
+	pg, err := taskgate.New(ppConfig(pb, ttl))
+	if err != nil {
+		t.Fatalf("New(生产者) 失败: %v", err)
+	}
+
+	// 先拉起两个分工 worker 再提交也行,顺序无所谓:blocked 子任务不进 pending,
+	// 这里先提交再拉起,顺带盖住"任务先于消费者存在"的路径。
+	ocrIDs := make([]string, 0, chains)
+	extractIDs := make([]string, 0, chains)
+	for i := 0; i < chains; i++ {
+		oid, serr := pg.Submit(context.Background(), ppOcrQueue,
+			[]byte(fmt.Sprintf(`{"n":%d}`, i)))
+		if serr != nil {
+			t.Fatalf("Submit ocr 第 %d 个失败: %v", i, serr)
+		}
+		eid, serr := pg.Submit(context.Background(), ppExtractQueue, nil, taskgate.DependsOn(oid))
+		if serr != nil {
+			t.Fatalf("Submit extract 第 %d 个失败: %v", i, serr)
+		}
+		ocrIDs = append(ocrIDs, oid)
+		extractIDs = append(extractIDs, eid)
+	}
+
+	extra := []string{"TASKGATE_MP_TOTAL=" + strconv.Itoa(total)}
+	wa := spawnHelper(t, "TestMultiprocPipelineHelper", mr.Addr(), ttl,
+		append([]string{"TASKGATE_MP_ROLE=ocr"}, extra...)...)
+	wb := spawnHelper(t, "TestMultiprocPipelineHelper", mr.Addr(), ttl,
+		append([]string{"TASKGATE_MP_ROLE=extract"}, extra...)...)
+
+	waitFor(t, 60*time.Second, func() bool {
+		counts, cerr := pg.Overview(context.Background())
+		return cerr == nil &&
+			counts[ppOcrQueue][taskgate.StatusCompleted] == chains &&
+			counts[ppExtractQueue][taskgate.StatusCompleted] == chains
+	}, "5 条 ocr→extract 依赖链应跨进程全部 completed")
+
+	counts, err := pg.Overview(context.Background())
+	if err != nil {
+		t.Fatalf("Overview 失败: %v", err)
+	}
+	for _, typ := range []string{ppOcrQueue, ppExtractQueue} {
+		if n := counts[typ][taskgate.StatusFailed]; n != 0 {
+			t.Fatalf("%s 不应有任务 failed,实际 %d", typ, n)
+		}
+		if n := counts[typ][taskgate.StatusCanceled]; n != 0 {
+			t.Fatalf("%s 不应有任务 canceled,实际 %d", typ, n)
+		}
+	}
+
+	// 逐链核对:extract 的 Result 里必须能看到从父任务 Get 来的内容。
+	for i := range extractIDs {
+		et := mustGet(t, pg, extractIDs[i])
+		if et.Status != taskgate.StatusCompleted {
+			t.Fatalf("extract 任务 %s 应 completed,实际 %s", et.ID, et.Status)
+		}
+		want := fmt.Sprintf(`"page-%d"`, i)
+		if !strings.Contains(string(et.Result), want) {
+			t.Fatalf("extract 任务 %s 的 Result 应拼进父任务产出 %s,实际 %s",
+				et.ID, want, et.Result)
+		}
+		ot := mustGet(t, pg, ocrIDs[i])
+		if !strings.Contains(string(et.Result), string(ot.Result)) {
+			t.Fatalf("extract Result 应原样包含 ocr Result %s,实际 %s", ot.Result, et.Result)
+		}
+	}
+
+	wa.waitOK(t)
+	wb.waitOK(t)
+}
+
+// TestMultiprocCancelHelper 跨进程取消专项的子进程 worker:
+// handler 认领后写哨兵文件(内容=任务 ID)通知父进程"开跑了",然后挂在 ctx.Done 上
+// 等取消——跨进程 Cancel 只打标记,要靠本进程下一次 Heartbeat(LeaseTTL/3)发现标记
+// 后 cancel handler ctx。全局 canceled 达到 TASKGATE_MP_TOTAL 后 Shutdown 正常退出。
+func TestMultiprocCancelHelper(t *testing.T) {
+	if os.Getenv("TASKGATE_MP_HELPER") != "1" {
+		t.Skip("仅作为跨进程取消专项的子进程 worker 运行")
+	}
+	addr := os.Getenv("TASKGATE_MP_ADDR")
+	sentinel := os.Getenv("TASKGATE_MP_SENTINEL")
+	ttl, err := time.ParseDuration(os.Getenv("TASKGATE_MP_TTL"))
+	if addr == "" || sentinel == "" || err != nil {
+		t.Fatalf("子进程环境变量不全: addr=%q sentinel=%q ttl=%v", addr, sentinel, err)
+	}
+	total, err := strconv.Atoi(os.Getenv("TASKGATE_MP_TOTAL"))
+	if err != nil || total <= 0 {
+		t.Fatalf("TASKGATE_MP_TOTAL 无效: %v", err)
+	}
+
+	b, err := redisbroker.New(redisbroker.Options{Addr: addr})
+	if err != nil {
+		t.Fatalf("子进程连 Redis(%s) 失败: %v", addr, err)
+	}
+	defer func() { _ = b.Close() }()
+	g, err := taskgate.New(mpConfig(b, ttl, 2))
+	if err != nil {
+		t.Fatalf("子进程 New 失败: %v", err)
+	}
+	g.Handle(mpQueue, func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+		if err := os.WriteFile(sentinel, []byte(task.ID), 0o644); err != nil {
+			return nil, err
+		}
+		<-ctx.Done() // 长任务:一直跑到被取消(心跳发现取消标记后 ctx 被 cancel)
+		return nil, ctx.Err()
+	})
+
+	shutdownWhenCounted(g, b, total, taskgate.StatusCanceled)
+	if err := g.Run(context.Background()); err != nil {
+		t.Fatalf("子进程 Run 返回错误: %v", err)
+	}
+}
+
+// TestMultiprocCancel 跨进程取消(T113-②,spec US4 场景 2 / SC-004):
+// 长任务在子进程 running,父进程用另一个 Gate(纯客户端,不 Run)发 Cancel——
+// cancelLocal 摸不到别的进程,只能靠子进程的心跳(LeaseTTL/3 ≈ 667ms)发现取消标记。
+// 断言:Cancel 后 3s(一个心跳周期 + 余量)内任务落 canceled;
+// 它的 FailFast 子任务(blocked,从没跑过)被同一次传播连锁 canceled。
+func TestMultiprocCancel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short 模式跳过多进程专项")
+	}
+	mr := miniredis.RunT(t)
+	sentinel := filepath.Join(t.TempDir(), "started")
+	const ttl = 2 * time.Second // 短租约:心跳周期 LeaseTTL/3 ≈ 667ms,取消尽快被发现
+
+	pb, err := redisbroker.New(redisbroker.Options{Addr: mr.Addr()})
+	if err != nil {
+		t.Fatalf("生产者连 Redis 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = pb.Close() })
+	pg, err := taskgate.New(mpConfig(pb, ttl, 2))
+	if err != nil {
+		t.Fatalf("New(生产者) 失败: %v", err)
+	}
+	parentID, err := pg.Submit(context.Background(), mpQueue, nil, taskgate.WithID("cancel-parent"))
+	if err != nil {
+		t.Fatalf("Submit 父任务失败: %v", err)
+	}
+	childID, err := pg.Submit(context.Background(), mpQueue, nil,
+		taskgate.WithID("cancel-child"), taskgate.DependsOn(parentID))
+	if err != nil {
+		t.Fatalf("Submit 子任务失败: %v", err)
+	}
+
+	// 子进程 worker:认领父任务后写哨兵,挂在 ctx.Done 上等取消。
+	w := spawnHelper(t, "TestMultiprocCancelHelper", mr.Addr(), ttl,
+		"TASKGATE_MP_SENTINEL="+sentinel, "TASKGATE_MP_TOTAL=2")
+	waitFor(t, 30*time.Second, func() bool {
+		got, serr := os.ReadFile(sentinel)
+		return serr == nil && string(got) == parentID
+	}, "子进程应认领父任务并写出哨兵文件")
+	waitFor(t, 10*time.Second, func() bool {
+		task, gerr := pg.Get(context.Background(), parentID)
+		return gerr == nil && task.Status == taskgate.StatusRunning
+	}, "父任务应处于 running(被子进程持有)")
+
+	// 跨进程 Cancel:父进程本地没有这个任务在跑,纯打标记。
+	canceledAt := time.Now()
+	if err := pg.Cancel(context.Background(), parentID); err != nil {
+		t.Fatalf("Cancel 失败: %v", err)
+	}
+	// 一个心跳周期(667ms)+ 传播与落库余量,3s 封顶(spec US4:心跳周期内生效)。
+	waitFor(t, 3*time.Second, func() bool {
+		task, gerr := pg.Get(context.Background(), parentID)
+		return gerr == nil && task.Status == taskgate.StatusCanceled
+	}, "跨进程 Cancel 应在一个心跳周期(LeaseTTL/3+余量)内让任务落 canceled")
+	t.Logf("跨进程 Cancel 生效耗时 %v(心跳周期 %v)", time.Since(canceledAt), ttl/3)
+
+	// FailFast 传播:blocked 的子任务被连锁 canceled(与父同一段脚本收敛,
+	// 父落 canceled 后子必然可见,这里仍给个短轮询防偶发)。
+	waitFor(t, 3*time.Second, func() bool {
+		task, gerr := pg.Get(context.Background(), childID)
+		return gerr == nil && task.Status == taskgate.StatusCanceled
+	}, "FailFast 子任务应被连锁 canceled")
+
+	w.waitOK(t)
 }

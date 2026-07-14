@@ -678,18 +678,20 @@ func TestPoisonTaskLeaseCap(t *testing.T) {
 	})
 }
 
-// TestSlowTaskAutoRenew 慢任务自动续租:LeaseTTL=300ms,handler 真跑 3×TTL(900ms),
+// TestSlowTaskAutoRenew 慢任务自动续租:LeaseTTL=800ms,handler 真跑 3×TTL(2.4s),
 // 期间心跳每 TTL/3 续租、reaper 每 TTL/2 在扫,任务全程不被误回收:
 // 最终 completed 且 LeaseLost=0(SC-004 的"零误回收")。
+// TTL 不能给太小:全量 -race 下多进程专项抢 CPU,心跳 goroutine 被调度延迟超过
+// 一个 TTL 就会被 reaper 误回收一次(300ms 档在满负载下实测偶发),800ms 留足抖动余量。
 func TestSlowTaskAutoRenew(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
 		g := newGateOn(t, b, taskgate.Config{
 			Queues: map[string]taskgate.QueueConfig{
-				"slow": {Workers: 1, LeaseTTL: taskgate.Duration(300 * time.Millisecond)},
+				"slow": {Workers: 1, LeaseTTL: taskgate.Duration(800 * time.Millisecond)},
 			},
 		})
 		g.Handle("slow", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
-			time.Sleep(900 * time.Millisecond) // 3 倍租约时长,不续租必被回收
+			time.Sleep(2400 * time.Millisecond) // 3 倍租约时长,不续租必被回收
 			return []byte(`"survived"`), nil
 		})
 		startGate(t, g)

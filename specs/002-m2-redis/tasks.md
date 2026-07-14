@@ -68,7 +68,7 @@
 
 ## Phase 5: User Story 4 - 跨进程流水线与取消 (Priority: P2)
 
-- [ ] T113 [US4] multiproc_test.go 增加:① 进程 A 只消费 ocr 队列、进程 B 只消费 extract 队列,依赖链跨进程唤醒全 completed;② 任务在子进程 running,父进程发 Cancel,断言一个心跳周期(LeaseTTL/3+余量)内落 canceled 且传播生效
+- [x] T113 [US4] multiproc_test.go 增加:① 进程 A 只消费 ocr 队列、进程 B 只消费 extract 队列,依赖链跨进程唤醒全 completed;② 任务在子进程 running,父进程发 Cancel,断言一个心跳周期(LeaseTTL/3+余量)内落 canceled 且传播生效
 
 **Checkpoint**: SC-004 成立。
 
@@ -76,16 +76,16 @@
 
 ## Phase 6: User Story 5 - Stats O(1) 与基准 (Priority: P3)
 
-- [ ] T114 [US5] 验证 Counts/QueueLen 实现为计数器/长度读取(代码审视+契约 13 已盖行为);README 补 redis 键名速查(运维 LLEN 直查,FR-012)
-- [ ] T115 [US5] `bench_test.go`:BenchmarkEnqueue(单/32 并发×sqlite/redis)、BenchmarkDequeueAck(W=8,RPS=0)、BenchmarkPipeline(三级链);跑一轮把 ns/op 回写 docs/plans/2026-07-14-测试方案.md 第 6 节(注明 redis=miniredis 含其开销)
+- [x] T114 [US5] 验证 Counts/QueueLen 实现为计数器/长度读取(代码审视+契约 13 已盖行为);README 补 redis 键名速查(运维 LLEN 直查,FR-012)
+- [x] T115 [US5] `bench_test.go`:BenchmarkEnqueue(单/32 并发×sqlite/redis)、BenchmarkDequeueAck(W=8,RPS=0)、BenchmarkPipeline(三级链);跑一轮把 ns/op 回写 docs/plans/2026-07-14-测试方案.md 第 6 节(注明 redis=miniredis 含其开销)
 
 ---
 
 ## Phase 7: Polish & Cross-Cutting
 
-- [ ] T116 [P] 导出符号 godoc 补全(redisbroker 全包+根包新接口);README 更新:Redis 后端快速开始、分布式限流说明、跨进程延迟(Dequeue≤100ms/Cancel≤心跳周期)与已知限制
-- [ ] T117 运行 quickstart.md 验收检查点全表(含覆盖率 redisbroker ≥80%、连跑 3 遍、gofmt/vet);宪法取证 grep
-- [ ] T118 完成记录写 docs/plans/2026-07-14-M2完成记录.md(交付/验收/裁决/M3 待办)——git 提交由主控做
+- [x] T116 [P] 导出符号 godoc 补全(redisbroker 全包+根包新接口);README 更新:Redis 后端快速开始、分布式限流说明、跨进程延迟(Dequeue≤100ms/Cancel≤心跳周期)与已知限制
+- [x] T117 运行 quickstart.md 验收检查点全表(含覆盖率 redisbroker ≥80%、连跑 3 遍、gofmt/vet);宪法取证 grep
+- [x] T118 完成记录写 docs/plans/2026-07-15-M2完成记录.md(交付/验收/裁决/M3 待办)——git 提交由主控做
 
 ---
 
