@@ -60,10 +60,10 @@ go test -tags realgw ./e2e/ -run RealGW -v   # 手动冒烟(需 LLM_GATEWAY_URL/
 
 ## 验收检查点(M3 完成定义)
 
-- [ ] brokertest 18 条契约三后端全绿(含新 ListPagination)
-- [ ] L4 五用例全绿且离线确定(固定种子;{W:2} 档 MaxConcurrency≤2 且 BusyCount=0;{W:5} 档零 failed;流水线 30/30;中途取消;SSE 藏错误)
-- [ ] 手动续租三场景全绿(保活/回收/过期令牌;非任务 ctx ErrNoTask)
-- [ ] ManualHeartbeat=false 全量零回归
-- [ ] realgw 常规构建零引入(`go vet ./...` 与不带 tag 的 `go test` 不编译它)
-- [ ] `go test ./... -race -count=1` 连跑 3 遍;覆盖率核心 ≥85%、各后端 ≥80%
-- [ ] README/godoc 更新;完成记录写 docs/plans/
+- [x] brokertest 18 条契约三后端全绿(含新 ListPagination)
+- [x] L4 五用例全绿且离线确定(固定种子;{W:2} 档 MaxConcurrency=2 且 BusyCount=0;{W:5} 档零 failed 且 Throttled≈2450 真实触发;流水线 30/30 逐份传递正确;中途取消连锁生效;SSE 藏错误 2 次重排后成功)
+- [x] 手动续租三场景全绿(保活 3×TTL LeaseLost=0/不续被回收 LeaseLost=1/过期令牌 ErrLeaseLost;非任务 ctx ErrNoTask)
+- [x] ManualHeartbeat=false 全量零回归
+- [x] realgw 常规构建零引入(`go vet ./...` 与不带 tag 的 `go test` 不编译它,`-run RealGW` 报 no tests to run)
+- [x] `go test ./... -race -count=1` 连跑 3 遍全绿;覆盖率核心 89.2%、memory 88.9%、sqlite 85.9%、redis 84.6%(核心 ≥85%、各后端 ≥80% 达标)
+- [x] README/godoc 更新;完成记录写 docs/plans/2026-07-15-M3完成记录.md
