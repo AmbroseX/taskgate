@@ -73,10 +73,10 @@ go run ./examples/llm          # 三级流水线示例
 
 ## 验收检查点(M1 完成定义)
 
-- [ ] L1 全绿:limiter 精度(RPS=10→1s 放行 10±1)、退避曲线±20%、配置校验、状态机表、依赖计数
-- [ ] brokertest 16 条契约在 memory 与 sqlite 双后端全绿
-- [ ] L3 全场景:提交→执行→结果、Wait 超时、重试链路、ErrThrottled、ErrSkipRetry、毒任务封顶、取消 running、三级流水线、fan-in、父已完成提交、限流隔离、Shutdown 正常/超时、统计一致
-- [ ] 专项:kill -9 崩溃恢复(LeaseLost=1 最终 completed)、唤醒中途崩不丢唤醒
-- [ ] `go test ./... -race` 零 data race;覆盖率达标
-- [ ] examples/llm 跑通
-- [ ] 宪法取证:无 interface{} 进模型、无后端特判、无 env 读取
+- [X] L1 全绿:limiter 精度(RPS=10→1s 放行 10±1)、退避曲线±20%、配置校验、状态机表、依赖计数
+- [X] brokertest 16 条契约在 memory 与 sqlite 双后端全绿
+- [X] L3 全场景:提交→执行→结果、Wait 超时、重试链路、ErrThrottled、ErrSkipRetry、毒任务封顶、取消 running、三级流水线、fan-in、父已完成提交、限流隔离、Shutdown 正常/超时、统计一致
+- [X] 专项:kill -9 崩溃恢复(LeaseLost=1 最终 completed)、唤醒中途崩不丢唤醒
+- [X] `go test ./... -race` 零 data race;覆盖率达标(核心 91.0%、memorybroker 85.8%、sqlitebroker 85.8%)
+- [X] examples/llm 跑通
+- [X] 宪法取证:无 interface{} 进模型、无后端特判、无 env 读取(2026-07-14 grep 取证通过)

@@ -21,12 +21,19 @@ type scheduler struct {
 
 	mu      sync.Mutex
 	started bool
+	// stopClaims 本轮 Run 的内部取消:Shutdown 靠它停掉认领循环和 reaper。没在 Run 时为 nil。
+	stopClaims context.CancelFunc
+	// runExited 本轮 Run 完全收尾(worker/reaper 全退出)后关闭,Shutdown 等它。
+	runExited chan struct{}
 	// running 每队列"本进程正在执行的任务数",给 Stats 用;没 Run 过的队列读到 0。
 	running map[string]*atomic.Int64
 
 	// tasks 本进程在跑任务的取消句柄表(id → runningTask),Gate.Cancel 靠它即时打断。
 	tasksMu sync.Mutex
 	tasks   map[string]*runningTask
+	// draining Shutdown 已超时、正在打断在跑任务:此后新登记的任务也一律打断走 Requeue
+	// (堵住"任务刚认领还没来得及登记,躲过了 Shutdown 那一轮扫描"的窗口)。
+	draining bool
 }
 
 // runningTask 一个在跑任务的运行期状态,心跳 goroutine 和 handler 收尾逻辑共享。
@@ -34,6 +41,7 @@ type runningTask struct {
 	cancel    context.CancelFunc
 	canceled  atomic.Bool // 被请求取消(本地 Cancel 即时打断,或 Heartbeat 发现取消标记)
 	leaseLost atomic.Bool // 租约已丢:任务已被 reaper 处理掉,handler 的结果必须作废
+	requeue   atomic.Bool // Shutdown 超时打断:handler 退出后走 Requeue 归还,不算取消也不算失败
 }
 
 func newScheduler(g *Gate) *scheduler {
@@ -45,10 +53,15 @@ func newScheduler(g *Gate) *scheduler {
 }
 
 // track / untrack 登记与注销在跑任务的取消句柄。
+// Shutdown 超时扫描之后才登记进来的任务(认领和扫描赛跑的窗口),在这里补打断。
 func (s *scheduler) track(id string, rt *runningTask) {
 	s.tasksMu.Lock()
 	defer s.tasksMu.Unlock()
 	s.tasks[id] = rt
+	if s.draining {
+		rt.requeue.Store(true)
+		rt.cancel()
+	}
 }
 
 func (s *scheduler) untrack(id string) {
@@ -96,7 +109,7 @@ func (s *scheduler) consumeQueues() (map[string]QueueConfig, error) {
 	return out, nil
 }
 
-// run 消费主入口:每队列起一条认领循环,阻塞到 ctx 取消,
+// run 消费主入口:每队列起一条认领循环,阻塞到 ctx 取消或 Shutdown,
 // 然后停止认领、等所有在跑的 handler 退出后返回 nil。
 func (s *scheduler) run(ctx context.Context) error {
 	queues, err := s.consumeQueues()
@@ -107,12 +120,24 @@ func (s *scheduler) run(ctx context.Context) error {
 		return errors.New("taskgate: run: no handler registered, nothing to consume")
 	}
 
+	// 内部 ctx:外层 ctx 取消或 Shutdown 调 stopClaims 都能停掉认领循环和 reaper。
+	runCtx, stopClaims := context.WithCancel(ctx)
+	defer stopClaims()
+	runExited := make(chan struct{})
+
 	s.mu.Lock()
+	if s.gate.isShutdown() {
+		// Shutdown 之后再 Run 是接线错误:认领循环一旦起来就没人负责停它了。
+		s.mu.Unlock()
+		return ErrShutdown
+	}
 	if s.started {
 		s.mu.Unlock()
 		return errors.New("taskgate: run: already running")
 	}
 	s.started = true
+	s.stopClaims = stopClaims
+	s.runExited = runExited
 	limiters := make(map[string]*limiter, len(queues))
 	for name, qc := range queues {
 		if _, ok := s.running[name]; !ok {
@@ -121,6 +146,7 @@ func (s *scheduler) run(ctx context.Context) error {
 		limiters[name] = newLimiter(qc.Workers, qc.RPS, qc.Burst)
 	}
 	s.mu.Unlock()
+	ctx = runCtx
 
 	// 全局 reaper:周期 = min(各消费队列 LeaseTTL)/2,定期捞回过期租约(T019)。
 	minTTL := time.Duration(0)
@@ -144,14 +170,55 @@ func (s *scheduler) run(ctx context.Context) error {
 			s.claimLoop(ctx, queue, limiters[queue], &workerWG, ttl)
 		}(name, time.Duration(qc.LeaseTTL))
 	}
-	claimWG.Wait()  // ctx 取消后认领循环全部退出
-	workerWG.Wait() // 等在跑任务收尾(不打断 handler)
+	claimWG.Wait()  // ctx 取消/Shutdown 后认领循环全部退出
+	workerWG.Wait() // 等在跑任务收尾(不打断 handler;Shutdown 超时打断走 requeue 标记)
 	<-reaperDone    // reaper 随 Run 结束一起停
 
 	s.mu.Lock()
 	s.started = false
+	s.stopClaims = nil
+	s.runExited = nil
 	s.mu.Unlock()
+	close(runExited) // 告诉 Shutdown:全部后台 goroutine 已收尾
 	return nil
+}
+
+// shutdown Shutdown 的编排本体(Gate.Shutdown 保证只进来一次):
+//  1. 停认领:cancel 内部 runCtx,认领循环、限流等待、reaper 一起停;
+//  2. 等在跑任务善终(runExited 在 workerWG.Wait 之后才关);
+//  3. ctx 先到期:给所有在跑任务打 requeue 标记并 cancel 其 ctx,
+//     handler 退出后由 execute 调 Broker.Requeue 归还(不占任何计数),
+//     等收尾完成后返回 ctx 的超时错误。
+//
+// 没在 Run(纯生产者)时没有在跑任务,直接返回 nil。
+func (s *scheduler) shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	stopClaims := s.stopClaims
+	runExited := s.runExited
+	s.mu.Unlock()
+	if stopClaims == nil {
+		return nil // 没有消费循环在跑,停机标记已生效,没别的要等
+	}
+	stopClaims()
+
+	select {
+	case <-runExited:
+		return nil // 全部在跑任务善终,后台 goroutine 已收尾
+	case <-ctx.Done():
+	}
+
+	// 超时:打断所有在跑任务。requeue 标记必须先打再 cancel,
+	// 保证 execute 看到 ctx 被取消时一定能读到标记,不会误走 failTask。
+	s.tasksMu.Lock()
+	s.draining = true
+	for _, rt := range s.tasks {
+		rt.requeue.Store(true)
+		rt.cancel()
+	}
+	s.tasksMu.Unlock()
+
+	<-runExited // handler 退出 → Requeue 落库 → worker/reaper 全收尾,零泄漏
+	return ctx.Err()
 }
 
 // claimLoop 单队列认领循环。
@@ -282,9 +349,16 @@ func (s *scheduler) execute(t *Task, ttl time.Duration) {
 		// 这份结果作废,Ack/Fail 都不许发。
 	case rt.canceled.Load() && taskCtx.Err() != nil:
 		// 取消导致的退出:以 canceled 落库并触发依赖传播。
+		// 注意 canceled 标记只有"用户取消"路径会打(cancelLocal / Heartbeat 回音),
+		// Shutdown 的打断不打它,所以停机不会被误判成用户取消。
 		_ = s.gate.broker.FinishCanceled(ctx, t.ID, t.LeaseToken)
 	case err == nil:
+		// 正常干完的结果照收(哪怕 Shutdown 已打断:活都干完了,归还回去重跑才是浪费)。
 		_ = s.gate.broker.Ack(ctx, t.ID, t.LeaseToken, result)
+	case rt.requeue.Load() && taskCtx.Err() != nil:
+		// Shutdown 超时打断:没干完不算失败,原样归还回 pending,
+		// Attempts/LeaseLost/Throttled/RunAt 一个都不动(Requeue 合同)。
+		_ = s.gate.broker.Requeue(ctx, t.ID, t.LeaseToken)
 	default:
 		s.failTask(ctx, t, err)
 	}

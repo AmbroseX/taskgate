@@ -1097,3 +1097,274 @@ func TestCancelFinalTask(t *testing.T) {
 		}
 	})
 }
+
+// ---------- Phase 9(US7):Shutdown 优雅停止 ----------
+
+// TestShutdownGraceful Shutdown 正常路径:3 个任务在跑,Shutdown(5s) 等它们全部干完
+// 才返回 nil;停机期间新 Submit 一律 ErrShutdown;重复 Shutdown 幂等。
+func TestShutdownGraceful(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"work": {Workers: 3}},
+		})
+		started := make(chan struct{}, 3)
+		release := make(chan struct{})
+		g.Handle("work", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			started <- struct{}{}
+			<-release // 卡住,等测试放行
+			return []byte(`"done"`), nil
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		ids := make([]string, 3)
+		for i := range ids {
+			id, err := g.Submit(ctx, "work", nil)
+			if err != nil {
+				t.Fatalf("Submit 失败: %v", err)
+			}
+			ids[i] = id
+		}
+		for i := 0; i < 3; i++ {
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("等待 3 个任务开跑超时")
+			}
+		}
+
+		// 后台发起 Shutdown(额度 5s,足够任务善终)。
+		shutdownErr := make(chan error, 1)
+		go func() {
+			sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			shutdownErr <- g.Shutdown(sctx)
+		}()
+
+		// 停机标记生效后,新 Submit 必须拒收(标记在 Shutdown 一进门就置位,轮询等它可见)。
+		waitFor(t, 5*time.Second, func() bool {
+			_, err := g.Submit(ctx, "work", nil)
+			return errors.Is(err, taskgate.ErrShutdown)
+		}, "Shutdown 期间 Submit 应返回 ErrShutdown")
+
+		// 放行 handler:3 个在跑任务善终后 Shutdown 返回 nil。
+		close(release)
+		select {
+		case err := <-shutdownErr:
+			if err != nil {
+				t.Fatalf("Shutdown 应返回 nil,得到: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("等待 Shutdown 返回超时")
+		}
+		for _, id := range ids {
+			if got := mustGet(t, g, id).Status; got != taskgate.StatusCompleted {
+				t.Fatalf("任务 %s 应为 completed,实际 %s", id, got)
+			}
+		}
+
+		// 重复 Shutdown 幂等:第二次直接返回 nil。
+		if err := g.Shutdown(context.Background()); err != nil {
+			t.Fatalf("重复 Shutdown 应返回 nil,得到: %v", err)
+		}
+	})
+}
+
+// TestShutdownTimeout Shutdown 超时路径:handler 卡在 ctx.Done 上,Shutdown(300ms) 到点后
+// cancel 它的 ctx、等它退出并 Requeue 归还,返回 ctx 超时错误;
+// 任务回 pending 且 Attempts/LeaseLost/Throttled 全 0、RunAt 不变(Requeue 合同:不占任何计数)。
+func TestShutdownTimeout(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"stuck": {Workers: 1}},
+		})
+		started := make(chan struct{})
+		g.Handle("stuck", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			close(started)
+			<-ctx.Done() // 只听取消信号,自己绝不主动结束
+			return nil, ctx.Err()
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		id, err := g.Submit(ctx, "stuck", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		runAtBefore := mustGet(t, g, id).RunAt
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("等待任务开跑超时")
+		}
+
+		sctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer cancel()
+		if err := g.Shutdown(sctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown 超时应返回 ctx 超时错误,得到: %v", err)
+		}
+
+		// Shutdown 返回时 Requeue 已落库:回 pending,三计数与 RunAt 全不动。
+		task := mustGet(t, g, id)
+		if task.Status != taskgate.StatusPending {
+			t.Fatalf("被打断的任务应回 pending,实际 %s", task.Status)
+		}
+		if task.Attempts != 0 || task.LeaseLost != 0 || task.Throttled != 0 {
+			t.Fatalf("Requeue 不占任何计数,实际 Attempts=%d LeaseLost=%d Throttled=%d",
+				task.Attempts, task.LeaseLost, task.Throttled)
+		}
+		if !task.RunAt.Equal(runAtBefore) {
+			t.Fatalf("Requeue 不动 RunAt,之前 %v,之后 %v", runAtBefore, task.RunAt)
+		}
+
+		// 停机后新 Submit 拒收。
+		if _, err := g.Submit(ctx, "stuck", nil); !errors.Is(err, taskgate.ErrShutdown) {
+			t.Fatalf("停机后 Submit 应返回 ErrShutdown,得到: %v", err)
+		}
+	})
+}
+
+// ---------- Phase 10(US8):OnStateChange 状态变更回调 ----------
+
+// stateRecorder 并发安全地收集回调快照。Notify 是异步送达,断言一律走 waitFor 轮询。
+type stateRecorder struct {
+	mu    sync.Mutex
+	snaps []taskgate.Task
+}
+
+func (r *stateRecorder) record(t taskgate.Task) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.snaps = append(r.snaps, t)
+}
+
+// statusesOf 返回指定任务按送达顺序收到的状态序列。
+func (r *stateRecorder) statusesOf(id string) []taskgate.Status {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []taskgate.Status
+	for _, s := range r.snaps {
+		if s.ID == id {
+			out = append(out, s.Status)
+		}
+	}
+	return out
+}
+
+// contains 序列里是否出现过某状态。
+func containsStatus(seq []taskgate.Status, want taskgate.Status) bool {
+	for _, s := range seq {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestOnStateChangeSequence 注册 OnStateChange 后跑一个任务:
+// 回调至少能观测到 pending、running、completed 三次流转,快照字段(ID/Type/Result)正确。
+func TestOnStateChangeSequence(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		rec := &stateRecorder{}
+		g := newGateOn(t, b, taskgate.Config{
+			Queues:        map[string]taskgate.QueueConfig{"watch": {Workers: 1}},
+			OnStateChange: rec.record,
+		})
+		g.Handle("watch", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return []byte(`"observed"`), nil
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		id, err := g.Submit(ctx, "watch", json.RawMessage(`{"k":1}`))
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if _, err := g.Wait(wctx, id); err != nil {
+			t.Fatalf("Wait 失败: %v", err)
+		}
+
+		// Notify 异步:等三种状态全部送达,不假设即时性。
+		waitFor(t, 5*time.Second, func() bool {
+			seq := rec.statusesOf(id)
+			return containsStatus(seq, taskgate.StatusPending) &&
+				containsStatus(seq, taskgate.StatusRunning) &&
+				containsStatus(seq, taskgate.StatusCompleted)
+		}, "回调应观测到 pending/running/completed 三次流转")
+
+		// 快照字段抽查:completed 那条要带 Type 与 Result。
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		for _, s := range rec.snaps {
+			if s.ID != id || s.Status != taskgate.StatusCompleted {
+				continue
+			}
+			if s.Type != "watch" {
+				t.Fatalf("快照 Type 应为 watch,实际 %q", s.Type)
+			}
+			if string(s.Result) != `"observed"` {
+				t.Fatalf("completed 快照应带 Result,实际 %s", s.Result)
+			}
+			return
+		}
+		t.Fatal("没找到 completed 的快照")
+	})
+}
+
+// TestOnStateChangePanic 回调每次都 panic:主流程完全不受影响,任务照常 completed。
+func TestOnStateChangePanic(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		var fired atomic.Int32
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"boomcb": {Workers: 1}},
+			OnStateChange: func(task taskgate.Task) {
+				fired.Add(1)
+				panic("回调故意炸")
+			},
+		})
+		g.Handle("boomcb", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return []byte(`"fine"`), nil
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		id, err := g.Submit(ctx, "boomcb", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		result, err := g.Wait(wctx, id)
+		if err != nil {
+			t.Fatalf("回调 panic 不该影响任务,Wait 失败: %v", err)
+		}
+		if string(result) != `"fine"` {
+			t.Fatalf("Result 不对: %s", result)
+		}
+		// 回调确实被触发过(panic 被 recover 吃掉,不是压根没调)。
+		waitFor(t, 5*time.Second, func() bool { return fired.Load() >= 1 },
+			"回调应至少被触发一次")
+	})
+}
+
+// TestOnStateChangeProducerOnly 纯生产者 Gate(不 Handle 不 Run):
+// Submit 本身也是一次流转(→ pending),回调同样要送达。
+func TestOnStateChangeProducerOnly(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		rec := &stateRecorder{}
+		g := newGateOn(t, b, taskgate.Config{
+			Queues:        map[string]taskgate.QueueConfig{"produce": {Workers: 1}},
+			OnStateChange: rec.record,
+		})
+
+		id, err := g.Submit(context.Background(), "produce", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		waitFor(t, 5*time.Second, func() bool {
+			return containsStatus(rec.statusesOf(id), taskgate.StatusPending)
+		}, "纯生产者的 Submit 也应触发 pending 回调")
+	})
+}

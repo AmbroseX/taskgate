@@ -30,6 +30,7 @@ type ErrThrottled struct {
 	RetryAfter time.Duration
 }
 
+// Error 实现 error 接口。
 func (e ErrThrottled) Error() string {
 	return fmt.Sprintf("taskgate: throttled, retry after %v", e.RetryAfter)
 }
@@ -39,6 +40,7 @@ type ErrSkipRetry struct {
 	Err error
 }
 
+// Error 实现 error 接口。
 func (e ErrSkipRetry) Error() string {
 	return fmt.Sprintf("taskgate: skip retry: %v", e.Err)
 }

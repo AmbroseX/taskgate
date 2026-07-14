@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +25,9 @@ type Gate struct {
 	handlers map[string]Handler
 
 	sched *scheduler
+
+	// shutdown 停机标记:Shutdown 一进门就置位,此后 Submit 一律拒收 ErrShutdown。
+	shutdown atomic.Bool
 
 	// backoff 业务失败的退避函数(入参是当前 Attempts)。
 	// 默认是指数退避,留成字段是为了测试能换成毫秒级的短退避。
@@ -112,6 +116,9 @@ func (g *Gate) queueFor(taskType string) (string, QueueConfig, error) {
 // Submit 提交任务:按 Routes 定队列、应用提交选项、入队,返回任务 ID。
 // Delay 和 RunAt 都设置时 RunAt 生效(RunAt 是绝对时刻,语义更强)。
 func (g *Gate) Submit(ctx context.Context, taskType string, payload json.RawMessage, opts ...SubmitOption) (string, error) {
+	if g.isShutdown() {
+		return "", ErrShutdown
+	}
 	if taskType == "" {
 		return "", errors.New("taskgate: submit: task type is required")
 	}
@@ -211,6 +218,7 @@ type TaskFailedError struct {
 	LastError string // 最后一次失败/取消原因
 }
 
+// Error 实现 error 接口,带上任务 ID、终态与原因。
 func (e *TaskFailedError) Error() string {
 	return fmt.Sprintf("taskgate: task %s %s: %s", e.ID, e.Status, e.LastError)
 }
@@ -236,8 +244,30 @@ func (g *Gate) Wait(ctx context.Context, id string) (json.RawMessage, error) {
 	}
 }
 
-// Run 启动消费:按注册过 handler 的类型对应的队列起认领循环,阻塞到 ctx 取消,
-// 然后停止认领、等在跑任务全部收尾后返回。生命周期细节在 scheduler.go。
+// Run 启动消费:按注册过 handler 的类型对应的队列起认领循环,阻塞到 ctx 取消或 Shutdown,
+// 然后停止认领、等在跑任务全部收尾后返回(因 Shutdown 退出同样返回 nil)。
+// 生命周期细节在 scheduler.go。
 func (g *Gate) Run(ctx context.Context) error {
 	return g.sched.run(ctx)
+}
+
+// isShutdown 读停机标记。
+func (g *Gate) isShutdown() bool {
+	return g.shutdown.Load()
+}
+
+// Shutdown 优雅停止(US7):
+//  1. 一进门置停机标记,此后 Submit 一律返回 ErrShutdown,认领循环停止拿新任务;
+//  2. 等所有在跑任务善终(Run 也随之退出并返回 nil);
+//  3. ctx 先到期:cancel 各在跑任务的 handler ctx,等 handler 退出后把这些任务
+//     Requeue 回 pending(三计数与 RunAt 全不动),返回 ctx 的超时错误;
+//  4. 后台 goroutine(认领循环/心跳/reaper)全部同步收尾,返回后零泄漏;
+//  5. 重复调用幂等:第二次直接返回 nil。
+//
+// 注意 Shutdown 的打断不是用户取消:被打断的任务回 pending 等下次重跑,不会进 canceled。
+func (g *Gate) Shutdown(ctx context.Context) error {
+	if !g.shutdown.CompareAndSwap(false, true) {
+		return nil // 已经停过机,幂等
+	}
+	return g.sched.shutdown(ctx)
 }

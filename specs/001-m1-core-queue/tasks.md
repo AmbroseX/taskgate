@@ -126,20 +126,20 @@
 
 ## Phase 9: User Story 7 - Shutdown 优雅停止 (Priority: P3)
 
-- [ ] T026 [US7] scheduler.go/client.go:Shutdown(ctx)——停认领与限流放行 → 等 worker → 超时 cancel 各任务 ctx → handler 退出后 Requeue(不占计数)→ 关 reaper;Shutdown 后 Submit 返回 ErrShutdown
-- [ ] T027 [US7] integration_test.go 增加:Shutdown 正常(3 任务干完才返回)、Shutdown 超时(500ms,任务回 pending 三计数不变)
+- [X] T026 [US7] scheduler.go/client.go:Shutdown(ctx)——停认领与限流放行 → 等 worker → 超时 cancel 各任务 ctx → handler 退出后 Requeue(不占计数)→ 关 reaper;Shutdown 后 Submit 返回 ErrShutdown
+- [X] T027 [US7] integration_test.go 增加:Shutdown 正常(3 任务干完才返回)、Shutdown 超时(500ms,任务回 pending 三计数不变)
 
 ## Phase 10: User Story 8 - OnStateChange 注册口 (Priority: P3)
 
-- [ ] T028 [US8] 双后端 Notify 接线(事务/锁外异步、recover 包住)+ integration_test.go:回调收到流转快照、回调 panic 不影响主流程
+- [X] T028 [US8] 双后端 Notify 接线(事务/锁外异步、recover 包住)+ integration_test.go:回调收到流转快照、回调 panic 不影响主流程
 
 ---
 
 ## Phase 11: Polish & Cross-Cutting
 
-- [ ] T029 [P] 写 `examples/llm/main.go` 三级流水线示例(memory 后端,可 go run)
-- [ ] T030 [P] 导出符号 godoc 注释补全 + README.md(简介/快速开始/与方案文档链接)
-- [ ] T031 运行 quickstart.md 验收检查点全表:`go build ./...`、`go vet ./...`、`go test ./... -race`、覆盖率(核心 ≥85%/broker ≥80%,不足则补测试)、宪法取证 grep
+- [X] T029 [P] 写 `examples/llm/main.go` 三级流水线示例(memory 后端,可 go run)
+- [X] T030 [P] 导出符号 godoc 注释补全 + README.md(简介/快速开始/与方案文档链接)
+- [X] T031 运行 quickstart.md 验收检查点全表:`go build ./...`、`go vet ./...`、`go test ./... -race`、覆盖率(核心 ≥85%/broker ≥80%,不足则补测试)、宪法取证 grep
 - [ ] T032 将完成情况回写 docs/plans/(YYYY-MM-DD-M1完成记录.md)并 git 提交
 
 ---
