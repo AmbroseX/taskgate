@@ -1,6 +1,6 @@
 // Package redisbroker 是 Broker 的 Redis 后端:所有"多步读写必须原子"的操作
 // 都收进单段 Lua 脚本执行(宪法 III:终态更新与子任务唤醒同一段脚本收敛),
-// 语义以 memorybroker 为基准,由 brokertest 的 17 条契约统一验收。
+// 语义以 memorybroker 为基准,由 brokertest 的 18 条契约统一验收。
 //
 // 关键约定(specs/002-m2-redis/research.md):
 //   - 第 1 节:认领 = 单段 claim.lua 原子完成,不用 BLMOVE 两步;Dequeue 是 Go 侧轮询循环;

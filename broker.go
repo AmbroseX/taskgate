@@ -65,9 +65,17 @@ type LimiterProvider interface {
 }
 
 // Filter List 的过滤条件,零值字段表示不过滤。
+//
+// 排序与分页合同(M3 定型,三后端一致,见 contracts/broker-contract.md):
+//   - 结果一律按 (CreatedAt, ID) 升序:CreatedAt 由 broker 落库时统一写,
+//     同一毫秒内再按 ID 定序,保证全序;
+//   - 执行顺序写死:先按 Type/Queue/Status 过滤 → 排序 → 跳过 Offset 条 → 取 Limit 条;
+//   - Offset ≥ 匹配总数 → 返回空列表(nil error);Offset < 0 按 0 处理;
+//   - 翻页弱一致:翻页期间数据变动不承诺快照一致,只承诺"未变动的任务不丢不重"。
 type Filter struct {
 	Type   string
 	Queue  string
 	Status Status
 	Limit  int // 0=不限
+	Offset int // 排序后跳过的条数,0=不跳过
 }

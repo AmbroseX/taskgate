@@ -23,9 +23,9 @@
 
 **Independent Test**: brokertest ListPagination 在三后端全绿。
 
-- [ ] T201 [US3] broker.go Filter 加 Offset 字段+排序合同注释;修订 specs/001-m1-core-queue/contracts/broker-contract.md(Get/List 段写排序/Offset/越界语义,用例表加第 18 条 ListPagination)
-- [ ] T202 [US3] brokertest/cases_query.go 加 caseListPagination(25 任务 fakeclock 逐个 +1ms、3 页并集无重无漏、页内跨页升序、越界空、Offset+Limit=0 组合、过滤+分页组合)并挂入 suite.go——先让三后端红
-- [ ] T203 [US3] 三后端实现:memorybroker/broker.go(过滤后 sort+切片)、sqlitebroker/query.go(ORDER BY created_at,id + LIMIT/OFFSET,Limit=0 用 -1)、redisbroker/query.go(候选集排序+切片)——契约全绿
+- [x] T201 [US3] broker.go Filter 加 Offset 字段+排序合同注释;修订 specs/001-m1-core-queue/contracts/broker-contract.md(Get/List 段写排序/Offset/越界语义,用例表加第 18 条 ListPagination)
+- [x] T202 [US3] brokertest/cases_query.go 加 caseListPagination(25 任务 fakeclock 逐个 +1ms、3 页并集无重无漏、页内跨页升序、越界空、Offset+Limit=0 组合、过滤+分页组合)并挂入 suite.go——先让三后端红
+- [x] T203 [US3] 三后端实现:memorybroker/broker.go(过滤后 sort+切片)、sqlitebroker/query.go(ORDER BY created_at,id + LIMIT/OFFSET,Limit=0 用 -1)、redisbroker/query.go(候选集排序+切片)——契约全绿
 
 **Checkpoint**: brokertest 18 条三后端全绿,既有用例零回归。
 
@@ -37,9 +37,9 @@
 
 **Independent Test**: 手动档保活 3×TTL 零回收;不续则 LeaseLost+1;非任务 ctx 返回 ErrNoTask。
 
-- [ ] T204 [US2] errors.go 加 ErrNoTask;taskgate.go QueueConfig 加 ManualHeartbeat(yaml/json tag);client.go 加 RenewLease(ctx)+非导出 ctx key(骨架照 quickstart)
-- [ ] T205 [US2] scheduler.go:execute 把续租闭包注入 handler ctx(语义照 research 第 2 节:ErrTaskCanceled 先 cancel 再返回、ErrLeaseLost 置标记+cancel、网络错误原样);ManualHeartbeat=true 时不起心跳 goroutine(收尾通道短路,零泄漏)
-- [ ] T206 [US2] integration_test.go 加场景(双后端 memory/sqlite 即可,redis 走同一 scheduler 路径):自动档 RenewLease 与心跳共存、手动档定期续租跑 3×TTL 零回收(LeaseLost=0)、手动档不续租被回收(LeaseLost=1)、回收后旧 ctx 续租返回 ErrLeaseLost、非任务 ctx 返回 ErrNoTask、手动档 Shutdown 正常 Requeue
+- [x] T204 [US2] errors.go 加 ErrNoTask;taskgate.go QueueConfig 加 ManualHeartbeat(yaml/json tag);client.go 加 RenewLease(ctx)+非导出 ctx key(骨架照 quickstart)
+- [x] T205 [US2] scheduler.go:execute 把续租闭包注入 handler ctx(语义照 research 第 2 节:ErrTaskCanceled 先 cancel 再返回、ErrLeaseLost 置标记+cancel、网络错误原样);ManualHeartbeat=true 时不起心跳 goroutine(收尾通道短路,零泄漏)
+- [x] T206 [US2] integration_test.go 加场景(双后端 memory/sqlite 即可,redis 走同一 scheduler 路径):自动档 RenewLease 与心跳共存、手动档定期续租跑 3×TTL 零回收(LeaseLost=0)、手动档不续租被回收(LeaseLost=1)、回收后旧 ctx 续租返回 ErrLeaseLost、非任务 ctx 返回 ErrNoTask、手动档 Shutdown 正常 Requeue
 
 **Checkpoint**: US2 场景全绿;ManualHeartbeat=false 全量零回归。
 

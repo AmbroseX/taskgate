@@ -1,6 +1,6 @@
 // Package sqlitebroker 是 Broker 的 sqlite 文件后端:纯 Go 驱动(modernc.org/sqlite,免 cgo),
 // WAL 模式单文件落盘。所有"终态更新 + 子任务唤醒/连锁取消"都在同一个事务里完成(宪法 III),
-// 语义以 memorybroker 为基准,由 brokertest 的 17 条契约统一验收。
+// 语义以 memorybroker 为基准,由 brokertest 的 18 条契约统一验收。
 //
 // 并发模型:连接池收紧到 1 个连接(单进程内所有读写串行),配合 WAL + busy_timeout,
 // 避免 SQLITE_BUSY;跨进程的写入靠 Dequeue 的 100ms 兜底轮询发现。

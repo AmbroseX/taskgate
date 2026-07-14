@@ -14,7 +14,8 @@ const dequeueRetryWait = 100 * time.Millisecond
 
 // scheduler 消费侧编排:每个队列一条认领循环 + Workers 个并发槽,
 // 拿到任务后按 Type 找 handler 执行,成功 Ack、失败按错误分类 Fail。
-// 每个在跑任务配一条心跳 goroutine 自动续租(LeaseTTL/3),Run 期间有全局 reaper
+// 每个在跑任务配一条心跳 goroutine 自动续租(LeaseTTL/3;队列开了 ManualHeartbeat
+// 则不起心跳,由 handler 自己调 RenewLease 保活),Run 期间有全局 reaper
 // 定期回收过期租约;Cancel 通过 id→cancelFunc 表即时打断本进程在跑的 handler。
 type scheduler struct {
 	gate *Gate
@@ -187,10 +188,10 @@ func (s *scheduler) run(ctx context.Context) error {
 	var claimWG sync.WaitGroup  // 认领循环
 	for name, qc := range queues {
 		claimWG.Add(1)
-		go func(queue string, ttl time.Duration) {
+		go func(queue string, qc QueueConfig) {
 			defer claimWG.Done()
-			s.claimLoop(ctx, queue, limiters[queue], &workerWG, ttl)
-		}(name, time.Duration(qc.LeaseTTL))
+			s.claimLoop(ctx, queue, limiters[queue], &workerWG, qc)
+		}(name, qc)
 	}
 	claimWG.Wait()  // ctx 取消/Shutdown 后认领循环全部退出
 	workerWG.Wait() // 等在跑任务收尾(不打断 handler;Shutdown 超时打断走 requeue 标记)
@@ -248,7 +249,7 @@ func (s *scheduler) shutdown(ctx context.Context) error {
 // 为什么先占槽:令牌桶按时间匀速放行,拿了令牌却没槽跑,等槽期间这个令牌等于白烧
 // (启动配额被浪费),Workers 满载时实际吞吐会低于配置的 RPS;
 // 先占槽保证"每个令牌都花在马上能跑的任务上"。
-func (s *scheduler) claimLoop(ctx context.Context, queue string, lim QueueLimiter, workerWG *sync.WaitGroup, ttl time.Duration) {
+func (s *scheduler) claimLoop(ctx context.Context, queue string, lim QueueLimiter, workerWG *sync.WaitGroup, qc QueueConfig) {
 	cnt := s.running[queue]
 	for {
 		if err := lim.AcquireSlot(ctx); err != nil {
@@ -278,7 +279,7 @@ func (s *scheduler) claimLoop(ctx context.Context, queue string, lim QueueLimite
 				lim.ReleaseSlot()
 				workerWG.Done()
 			}()
-			s.execute(t, ttl)
+			s.execute(t, qc)
 		}()
 	}
 }
@@ -327,14 +328,15 @@ func (s *scheduler) heartbeatLoop(done <-chan struct{}, t *Task, rt *runningTask
 	}
 }
 
-// execute 执行单个已认领的任务:找 handler → 起心跳 → 跑 → 按退出原因回执。
-// 回执(Ack/Fail/FinishCanceled)用 Background ctx:哪怕 Run 的 ctx 已取消,
-// 跑完的结果也必须落库。三种退出三种回执(T019/T024):
+// execute 执行单个已认领的任务:找 handler → 注入续租闭包 → 起心跳(手动档不起)
+// → 跑 → 按退出原因回执。回执(Ack/Fail/FinishCanceled)用 Background ctx:
+// 哪怕 Run 的 ctx 已取消,跑完的结果也必须落库。三种退出三种回执(T019/T024):
 //   - 租约已丢 → 丢弃结果,不回执(reaper 已把任务处理掉,旧结果不许覆盖新事实);
 //   - 被取消且 ctx 确实被 cancel → FinishCanceled 落库 canceled;
 //   - 正常返回 → Ack;返回错误 → failTask 按错误分类 Fail。
-func (s *scheduler) execute(t *Task, ttl time.Duration) {
+func (s *scheduler) execute(t *Task, qc QueueConfig) {
 	ctx := context.Background()
+	ttl := time.Duration(qc.LeaseTTL)
 
 	h := s.gate.handlerFor(t.Type)
 	if h == nil {
@@ -355,14 +357,46 @@ func (s *scheduler) execute(t *Task, ttl time.Duration) {
 	s.track(t.ID, rt)
 	defer s.untrack(t.ID, rt)
 
+	// 续租闭包注入 handler ctx(所有队列都注入,自动/手动档都能调 RenewLease)。
+	// 错误语义与 heartbeatLoop 严格同路,不造第二套租约状态机(research 第 2 节):
+	//   - nil:续租成功;
+	//   - ErrTaskCanceled:续租照做,但任务被外部 Cancel 了——先 cancel handler ctx
+	//     再把原错误交给 handler(它立刻知道该退);
+	//   - ErrLeaseLost / ErrTaskNotFound:租约已丢,置"结果作废"标记 + cancel ctx,
+	//     统一返回 ErrLeaseLost(后面的回执判定自动丢弃这份结果);
+	//   - 其他错误(网络抖动等):原样返回,handler 自行决定重试。
+	taskCtx = context.WithValue(taskCtx, ctxKeyRenew{}, renewFunc(func() error {
+		err := s.gate.broker.Heartbeat(context.Background(), t.ID, t.LeaseToken)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, ErrTaskCanceled):
+			rt.canceled.Store(true)
+			rt.cancel()
+			return err
+		case errors.Is(err, ErrLeaseLost), errors.Is(err, ErrTaskNotFound):
+			rt.leaseLost.Store(true)
+			rt.cancel()
+			return ErrLeaseLost
+		default:
+			return err
+		}
+	}))
+
 	// 心跳 goroutine:handler 退出后必须先停心跳再回执,
 	// 否则回执把任务写成终态后心跳还在飞,会白吃一堆 ErrLeaseLost。
+	// 手动档(qc.ManualHeartbeat)不起心跳:hbExited 直接关闭,
+	// 下面的收尾路径(close(hbDone) / <-hbExited)零阻塞零泄漏。
 	hbDone := make(chan struct{})
 	hbExited := make(chan struct{})
-	go func() {
-		defer close(hbExited)
-		s.heartbeatLoop(hbDone, t, rt, ttl/3)
-	}()
+	if qc.ManualHeartbeat {
+		close(hbExited)
+	} else {
+		go func() {
+			defer close(hbExited)
+			s.heartbeatLoop(hbDone, t, rt, ttl/3)
+		}()
+	}
 
 	result, err := s.runHandler(taskCtx, h, t)
 	close(hbDone)

@@ -17,7 +17,8 @@ func (b *Broker) Get(ctx context.Context, id string) (*taskgate.Task, error) {
 	return &r.task, nil
 }
 
-// List 按 Filter 过滤,零值字段不过滤;结果按 CreatedAt(再按 ID)排序,行为确定。
+// List 按 Filter 过滤,零值字段不过滤;先过滤 → ORDER BY (created_at, id) 升序 →
+// LIMIT/OFFSET 分页(排序分页合同见 broker-contract.md,Offset 越界返回空)。
 func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task, error) {
 	query := `SELECT ` + taskCols + ` FROM tasks`
 	var conds []string
@@ -42,9 +43,19 @@ func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task,
 		}
 	}
 	query += " ORDER BY created_at, id"
-	if f.Limit > 0 {
+	if f.Limit > 0 || f.Offset > 0 {
+		// SQLite 语法上 OFFSET 必须跟在 LIMIT 后面:只给 Offset 不给 Limit 时,
+		// 用 LIMIT -1(SQLite 的"不限量")补位;Offset<0 走不进这个分支,等价按 0 处理。
+		limit := f.Limit
+		if limit <= 0 {
+			limit = -1
+		}
 		query += " LIMIT ?"
-		args = append(args, f.Limit)
+		args = append(args, limit)
+		if f.Offset > 0 {
+			query += " OFFSET ?"
+			args = append(args, f.Offset)
+		}
 	}
 	rows, err := b.db.QueryContext(ctx, query, args...)
 	if err != nil {

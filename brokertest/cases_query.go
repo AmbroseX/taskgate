@@ -1,9 +1,10 @@
 package brokertest
 
-// 契约 13~14:Counts/QueueLen 统计一致性、List 过滤。
+// 契约 13~14、18:Counts/QueueLen 统计一致性、List 过滤、List 分页。
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -168,5 +169,109 @@ func caseListFilter(t *testing.T, h *harness) {
 		if tk.Type != "llm" {
 			t.Fatalf("Limit 结果里混入了不满足过滤条件的任务: %s(type=%s)", tk.ID, tk.Type)
 		}
+	}
+}
+
+// listOrdered 按过滤条件取 ID 序列(保留 List 的返回顺序,分页用例专用),
+// 顺带断言结果本身满足 (CreatedAt, ID) 升序合同。
+func (h *harness) listOrdered(t *testing.T, f taskgate.Filter) []string {
+	t.Helper()
+	got, err := h.b.List(context.Background(), f)
+	if err != nil {
+		t.Fatalf("List(%+v) 失败: %v", f, err)
+	}
+	ids := make([]string, 0, len(got))
+	for i, tk := range got {
+		if i > 0 {
+			prev := got[i-1]
+			ok := prev.CreatedAt.Before(tk.CreatedAt) ||
+				(prev.CreatedAt.Equal(tk.CreatedAt) && prev.ID < tk.ID)
+			if !ok {
+				t.Fatalf("List(%+v) 第 %d/%d 条乱序:%s(created=%v) 应排在 %s(created=%v) 之前",
+					f, i, i+1, tk.ID, tk.CreatedAt, prev.ID, prev.CreatedAt)
+			}
+		}
+		ids = append(ids, tk.ID)
+	}
+	return ids
+}
+
+// equalOrdered 逐位比较两个 ID 序列(顺序敏感)。
+func equalOrdered(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// 契约 18 ListPagination:List 的排序与分页合同(M3,broker-contract.md 修订版)。
+// 25 个任务用 fakeclock 逐个 +1ms 入队保证 CreatedAt 全序;ID 故意按创建顺序**逆序**编号,
+// 专抓"只按 ID 排序"的错误实现——合同要求 (CreatedAt, ID) 升序,CreatedAt 优先。
+func caseListPagination(t *testing.T, h *harness) {
+	const total = 25
+
+	// created 按创建顺序记录 ID,就是全量结果的期望顺序。
+	// Type 掺两种:i 为偶数 llm、奇数 ocr,给"过滤+分页组合"用。
+	created := make([]string, 0, total)
+	var llmIDs []string
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("z%02d", total-1-i) // z24, z23, ..., z00:ID 序 = 创建序的反序
+		typ := "llm"
+		if i%2 == 1 {
+			typ = "ocr"
+		}
+		h.enqueue(t, task(id, typ, "qp"))
+		created = append(created, id)
+		if typ == "llm" {
+			llmIDs = append(llmIDs, id)
+		}
+		h.advance(time.Millisecond) // 每条间隔 1ms,CreatedAt 严格递增
+	}
+
+	// 全量无分页:顺序必须恰好等于创建顺序(而不是 ID 字典序)。
+	if got := h.listOrdered(t, taskgate.Filter{}); !equalOrdered(got, created) {
+		t.Fatalf("List(全量) 应按 (CreatedAt,ID) 升序=创建顺序返回,期望 %v,实际 %v", created, got)
+	}
+
+	// 三页翻完:Limit=10,Offset=0/10/20 → 10/10/5 条;
+	// 每页内容必须恰好是全量顺序的对应切片(页内升序 + 跨页升序 + 并集=全集无重无漏,一次盖住)。
+	pages := []struct {
+		offset, wantLen int
+	}{{0, 10}, {10, 10}, {20, 5}}
+	var union []string
+	for _, p := range pages {
+		got := h.listOrdered(t, taskgate.Filter{Limit: 10, Offset: p.offset})
+		want := created[p.offset : p.offset+p.wantLen]
+		if !equalOrdered(got, want) {
+			t.Fatalf("List(Limit=10, Offset=%d) 期望 %v,实际 %v", p.offset, want, got)
+		}
+		union = append(union, got...)
+	}
+	if !equalOrdered(union, created) {
+		t.Fatalf("三页并集应=全集无重无漏,期望 %v,实际 %v", created, union)
+	}
+
+	// Offset 越界:返回空列表,nil error(listOrdered 内部已断言 err=nil)。
+	if got := h.listOrdered(t, taskgate.Filter{Limit: 10, Offset: 100}); len(got) != 0 {
+		t.Fatalf("List(Offset=100) 越界应返回空,实际 %v", got)
+	}
+
+	// Offset=5 + Limit=0(不限):返回排序后剩余的 20 条。
+	if got := h.listOrdered(t, taskgate.Filter{Offset: 5}); !equalOrdered(got, created[5:]) {
+		t.Fatalf("List(Offset=5, Limit=0) 应返回剩余 20 条,期望 %v,实际 %v", created[5:], got)
+	}
+
+	// Type 过滤 + 分页组合:先过滤(llm 共 13 条)再排序再分页。
+	if got := h.listOrdered(t, taskgate.Filter{Type: "llm", Limit: 5, Offset: 5}); !equalOrdered(got, llmIDs[5:10]) {
+		t.Fatalf("List(Type=llm, Limit=5, Offset=5) 期望 %v,实际 %v", llmIDs[5:10], got)
+	}
+	// 过滤后越界:同样返回空。
+	if got := h.listOrdered(t, taskgate.Filter{Type: "llm", Limit: 5, Offset: 13}); len(got) != 0 {
+		t.Fatalf("List(Type=llm, Offset=13) 过滤后越界应返回空,实际 %v", got)
 	}
 }

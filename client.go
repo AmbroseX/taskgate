@@ -223,6 +223,30 @@ func (e *TaskFailedError) Error() string {
 	return fmt.Sprintf("taskgate: task %s %s: %s", e.ID, e.Status, e.LastError)
 }
 
+// renewFunc scheduler 在 execute 里注入 handler ctx 的续租闭包(见 scheduler.go)。
+type renewFunc func() error
+
+// ctxKeyRenew 续租闭包的 ctx key。非导出:只有 scheduler 能注入,外部伪造不了。
+type ctxKeyRenew struct{}
+
+// RenewLease 在 handler 里手动给当前任务续租(lease_until = now + LeaseTTL)。
+// 自动档(默认)也可以调,与自动心跳互不干扰;手动档(QueueConfig.ManualHeartbeat=true)
+// 必须靠它保活。ctx 必须是 handler 收到的那个任务 ctx(或它的子 ctx)。返回值:
+//   - nil:续租成功;
+//   - ErrTaskCanceled:任务已被外部 Cancel(续租照做),此时任务 ctx 已被 cancel,
+//     handler 应尽快退出;
+//   - ErrLeaseLost:租约已丢(任务被 reaper 回收),结果注定作废,任务 ctx 已被
+//     cancel,handler 应立即放弃;
+//   - ErrNoTask:ctx 不是任务 ctx(handler 之外调用);
+//   - 其他错误(网络抖动等):续租没成也没丢,handler 可稍后重试。
+func RenewLease(ctx context.Context) error {
+	fn, ok := ctx.Value(ctxKeyRenew{}).(renewFunc)
+	if !ok {
+		return ErrNoTask
+	}
+	return fn()
+}
+
 // Wait 阻塞等任务到终态:completed 返回 Result;failed/canceled 返回 *TaskFailedError;
 // ctx 先取消返回 ctx.Err()(任务本身照常跑,Wait 只是不等了)。
 // 实现是 50ms 轮询 Get,间隔走注入的 clock。

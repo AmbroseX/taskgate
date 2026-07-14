@@ -22,6 +22,8 @@ var (
 	ErrUnknownType = errors.New("taskgate: no handler registered for task type")
 	// ErrShutdown Gate 已经 Shutdown,拒绝新提交。
 	ErrShutdown = errors.New("taskgate: gate is shut down")
+	// ErrNoTask 在任务 handler 之外的 ctx 上调 RenewLease:ctx 里没有续租闭包。
+	ErrNoTask = errors.New("taskgate: no task associated with context")
 )
 
 // ErrThrottled handler 返回它表示"被网关限流了,过 RetryAfter 再来":

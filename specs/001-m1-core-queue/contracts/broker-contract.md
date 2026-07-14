@@ -40,6 +40,7 @@ type Filter struct {
     Queue  string
     Status Status
     Limit  int // 0=不限
+    Offset int // 排序后跳过的条数,0=不跳过(M3 新增,公开 API 只增不改)
 }
 ```
 
@@ -85,6 +86,11 @@ type Filter struct {
 
 ### Get / List / QueueLen / Counts
 - Get 不存在 → `ErrTaskNotFound`;返回副本,调用方改了不影响存储。
+- List 排序与分页合同(M3 修订,三后端一致):
+  - 结果一律按 `(CreatedAt, ID)` 升序:CreatedAt 由 broker 落库时统一写(毫秒),同一毫秒内再按 ID 定序,保证全序;
+  - 执行顺序写死:先按 Type/Queue/Status 过滤 → 排序 → 跳过 Offset 条 → 取 Limit 条(Limit=0 不限);
+  - Offset ≥ 匹配总数 → 空列表,nil error;Offset < 0 按 0 处理(宽容读接口);
+  - 翻页弱一致:翻页期间数据变动不承诺快照一致,只承诺"未变动的任务不丢不重"。
 - QueueLen = 该队列 status∈{pending,retrying} 的数量。
 - Counts = 出现过的 Type×Status 稀疏矩阵(只含计数非零的组合),与逐个 Get 汇总一致(brokertest 验证)。
 
@@ -118,5 +124,6 @@ type Filter struct {
 | 15 | RequeueNoCount | Requeue 后回 pending 且三计数与 RunAt 不变 |
 | 16 | IllegalTransition | 对 completed 任务 Ack/Fail → 错误;表驱动抽查非法流转 |
 | 17 | Notify | Enqueue/Dequeue/Ack 一条链,最终能观测到 pending/running/completed 三个快照且字段正确(异步、不保证跨操作顺序);回调 panic 不影响主流程 |
+| 18 | ListPagination | 25 任务(CreatedAt 逐个 +1ms 全序,ID 故意逆序)Limit=10 三页 10/10/5,并集=全集无重无漏;页内与跨页均 (CreatedAt,ID) 升序;Offset 越界返回空;Offset+Limit=0 返回剩余全部;Type 过滤+分页组合正确 |
 
 `brokertest.Run(t, factory func(t *testing.T) taskgate.Broker)`,内部用注入 fakeclock 控制时间(factory 返回的 broker 必须已 Init 且使用套件提供的 clock —— 具体做法:套件导出 `brokertest.Options(clk)` 供 factory 构造时传入)。

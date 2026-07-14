@@ -33,9 +33,11 @@ func (b *Broker) Get(ctx context.Context, id string) (*taskgate.Task, error) {
 	return decodeTask(fields)
 }
 
-// List 按 Filter 过滤,零值字段不过滤;结果按 CreatedAt(再按 ID)排序,行为确定。
+// List 按 Filter 过滤,零值字段不过滤;先过滤 → 内存按 (CreatedAt, ID) 升序 →
+// 切 [Offset, Offset+Limit)(排序分页合同见 broker-contract.md,Offset 越界返回空)。
 // 候选 ID 从索引集合取(Status 优先、其次 Type,否则七个状态集合并集),
-// 剩余条件读回 hash 后在 Go 侧过滤。
+// 剩余条件读回 hash 后在 Go 侧过滤。代价 O(候选集):分页不减少取回条数,
+// 大库存用 Filter 缩小候选集(已知限制,research 第 5 节裁决,不建 zset 二级索引)。
 func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task, error) {
 	if err := b.requireInit(); err != nil {
 		return nil, err
@@ -100,6 +102,15 @@ func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task,
 		}
 		return out[i].ID < out[j].ID
 	})
+	// 排序后切页:Offset<0 按 0 处理(宽容读接口),越界返回空;Limit=0 不限量。
+	off := f.Offset
+	if off < 0 {
+		off = 0
+	}
+	if off >= len(out) {
+		return nil, nil
+	}
+	out = out[off:]
 	if f.Limit > 0 && len(out) > f.Limit {
 		out = out[:f.Limit]
 	}

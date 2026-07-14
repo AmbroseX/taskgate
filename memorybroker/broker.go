@@ -1,7 +1,7 @@
 // Package memorybroker 是 Broker 的内存参考实现:单进程、单 sync.Mutex + sync.Cond。
 // 它是三后端的"语义基准":所有状态流转都在同一个锁临界区内完成,
 // 等价于 sqlite 的"同一个事务"——终态更新和子任务唤醒天然原子,不可能丢唤醒。
-// brokertest 的 17 条契约以它的行为为准。
+// brokertest 的 18 条契约以它的行为为准。
 package memorybroker
 
 import (
@@ -570,7 +570,8 @@ func (b *Broker) Get(ctx context.Context, id string) (*taskgate.Task, error) {
 	return cloneTask(&rec.task), nil
 }
 
-// List 按 Filter 过滤,零值字段不过滤;结果按 CreatedAt(再按 ID)排序,行为确定。
+// List 按 Filter 过滤,零值字段不过滤;先过滤 → 按 (CreatedAt, ID) 升序 → 跳过
+// Offset 再取 Limit(排序分页合同见 broker-contract.md,Offset 越界返回空)。
 func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -594,10 +595,24 @@ func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task,
 		}
 		return out[i].ID < out[j].ID
 	})
+	return pageSlice(out, f), nil
+}
+
+// pageSlice 排序后的结果按 Offset/Limit 切页:Offset<0 按 0 处理(宽容读接口),
+// 越界返回空;Limit=0 不限量。
+func pageSlice(out []*taskgate.Task, f taskgate.Filter) []*taskgate.Task {
+	off := f.Offset
+	if off < 0 {
+		off = 0
+	}
+	if off >= len(out) {
+		return nil
+	}
+	out = out[off:]
 	if f.Limit > 0 && len(out) > f.Limit {
 		out = out[:f.Limit]
 	}
-	return out, nil
+	return out
 }
 
 // QueueLen 队列积压:status∈{pending,retrying} 的数量(不看 RunAt 到没到点)。

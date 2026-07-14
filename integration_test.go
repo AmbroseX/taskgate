@@ -1426,3 +1426,248 @@ func TestOnStateChangeProducerOnly(t *testing.T) {
 		}, "纯生产者的 Submit 也应触发 pending 回调")
 	})
 }
+
+// ---------- M3 Phase 2(US2):handler 手动续租 ----------
+
+// forEachLocalBackend 手动续租场景只跑 memory/sqlite 双后端:
+// 续租闭包只依赖 Broker.Heartbeat 的行为合同(L2 契约已在三后端验收),
+// redis 走的是完全相同的 scheduler 路径,这里不重复铺矩阵。
+func forEachLocalBackend(t *testing.T, run func(t *testing.T, b taskgate.Broker)) {
+	for _, be := range backends {
+		if be.name == "redis" {
+			continue
+		}
+		t.Run(be.name, func(t *testing.T) {
+			b := be.make(t)
+			t.Cleanup(func() { _ = b.Close() })
+			run(t, b)
+		})
+	}
+}
+
+// TestRenewLeaseAutoMode 自动档(默认):自动心跳照常跳,handler 里手动调 RenewLease
+// 也必须成功,两者共存互不干扰,任务正常 completed 且零误回收。
+func TestRenewLeaseAutoMode(t *testing.T) {
+	forEachLocalBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"auto": {Workers: 1, LeaseTTL: taskgate.Duration(800 * time.Millisecond)},
+			},
+		})
+		renewErr := make(chan error, 1)
+		g.Handle("auto", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			// 跑 1.5×TTL,期间手动续租 6 次:每次都必须返回 nil。
+			for i := 0; i < 6; i++ {
+				if err := taskgate.RenewLease(ctx); err != nil {
+					renewErr <- err
+					return nil, err
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			return []byte(`"ok"`), nil
+		})
+		startGate(t, g)
+
+		id, err := g.Submit(context.Background(), "auto", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, err := g.Wait(ctx, id)
+		if err != nil {
+			select {
+			case rerr := <-renewErr:
+				t.Fatalf("自动档手动续租应成功,实际: %v(Wait: %v)", rerr, err)
+			default:
+				t.Fatalf("Wait 失败: %v", err)
+			}
+		}
+		if string(result) != `"ok"` {
+			t.Fatalf("Result 不对: %s", result)
+		}
+		task := mustGet(t, g, id)
+		if task.Status != taskgate.StatusCompleted || task.LeaseLost != 0 {
+			t.Fatalf("应 completed 且 LeaseLost=0,实际 status=%s LeaseLost=%d", task.Status, task.LeaseLost)
+		}
+	})
+}
+
+// TestManualHeartbeatKeepAlive 手动档保活:ManualHeartbeat=true 不起自动心跳,
+// handler 每 ≈TTL/3 手动续租一次、真跑 3×TTL(2.4s),全程零误回收:
+// completed 且 LeaseLost=0。TTL 用 800ms 而不是 300ms:全量 -race 满负载下
+// goroutine 调度抖动可能超过小 TTL(教训见 TestSlowTaskAutoRenew 注释)。
+func TestManualHeartbeatKeepAlive(t *testing.T) {
+	forEachLocalBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"manual": {Workers: 1, LeaseTTL: taskgate.Duration(800 * time.Millisecond), ManualHeartbeat: true},
+			},
+		})
+		g.Handle("manual", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			// 先续租再睡:保证每 250ms(≈TTL/3)一定有一次成功续租,余量 550ms。
+			deadline := time.Now().Add(2400 * time.Millisecond) // 3×TTL,不续租必被回收
+			for time.Now().Before(deadline) {
+				if err := taskgate.RenewLease(ctx); err != nil {
+					return nil, fmt.Errorf("手动续租失败: %w", err)
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+			return []byte(`"kept"`), nil
+		})
+		startGate(t, g)
+
+		id, err := g.Submit(context.Background(), "manual", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, err := g.Wait(ctx, id)
+		if err != nil {
+			t.Fatalf("Wait 失败: %v", err)
+		}
+		if string(result) != `"kept"` {
+			t.Fatalf("Result 不对: %s", result)
+		}
+		task := mustGet(t, g, id)
+		if task.Status != taskgate.StatusCompleted {
+			t.Fatalf("状态应为 completed,实际 %s", task.Status)
+		}
+		if task.LeaseLost != 0 {
+			t.Fatalf("手动续租保活下不该被回收,LeaseLost 应为 0,实际 %d", task.LeaseLost)
+		}
+	})
+}
+
+// TestManualHeartbeatReaped 手动档不续租 → 被 reaper 回收(一并验证旧租约续租返回
+// ErrLeaseLost):第一跑 handler 故意不续租,轮询 Get 观察到 LeaseLost=1(租约过期
+// 被回收、任务已回 pending)后再调一次 RenewLease——手动档没有自动心跳,本地不会
+// 自动发现租约已丢,这次续租必须拿到 ErrLeaseLost 且任务 ctx 已被闭包 cancel,
+// handler 顺势退出(结果作废,不回执);第二跑正常返回 → 最终 completed 且 LeaseLost=1。
+func TestManualHeartbeatReaped(t *testing.T) {
+	forEachLocalBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"noren": {Workers: 1, LeaseTTL: taskgate.Duration(800 * time.Millisecond), ManualHeartbeat: true},
+			},
+		})
+		var runs atomic.Int32
+		renewErr := make(chan error, 1)
+		ctxCanceled := make(chan bool, 1)
+		g.Handle("noren", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			if runs.Add(1) > 1 {
+				return []byte(`"second"`), nil // 第二跑:正常干完
+			}
+			// 第一跑:不续租,等 reaper 把租约回收(reaper 周期 TTL/2,轮询观察不靠猜时长)。
+			deadline := time.Now().Add(8 * time.Second)
+			for time.Now().Before(deadline) {
+				if tk, err := g.Get(context.Background(), task.ID); err == nil && tk.LeaseLost >= 1 {
+					break
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+			err := taskgate.RenewLease(ctx) // 旧租约续租 → 应 ErrLeaseLost
+			renewErr <- err
+			ctxCanceled <- ctx.Err() != nil // 闭包应已 cancel 任务 ctx
+			return nil, err
+		})
+		startGate(t, g)
+
+		id, err := g.Submit(context.Background(), "noren", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		result, err := g.Wait(ctx, id)
+		if err != nil {
+			t.Fatalf("Wait 失败: %v", err)
+		}
+		// 第一跑的结果已作废,落库的必须是第二跑的。
+		if string(result) != `"second"` {
+			t.Fatalf("Result 应为第二跑的输出,实际: %s", result)
+		}
+
+		select {
+		case rerr := <-renewErr:
+			if !errors.Is(rerr, taskgate.ErrLeaseLost) {
+				t.Fatalf("租约被回收后 RenewLease 应返回 ErrLeaseLost,实际: %v", rerr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("等第一跑的 RenewLease 结果超时")
+		}
+		select {
+		case canceled := <-ctxCanceled:
+			if !canceled {
+				t.Fatal("RenewLease 拿到 ErrLeaseLost 后,任务 ctx 应已被 cancel")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("等第一跑的 ctx 状态超时")
+		}
+
+		task := mustGet(t, g, id)
+		if task.Status != taskgate.StatusCompleted {
+			t.Fatalf("状态应为 completed,实际 %s", task.Status)
+		}
+		if task.LeaseLost != 1 {
+			t.Fatalf("恰好被回收一次,LeaseLost 应为 1,实际 %d", task.LeaseLost)
+		}
+	})
+}
+
+// TestRenewLeaseOutsideTask 非任务 ctx 调 RenewLease → ErrNoTask(ctx 里没有续租闭包)。
+func TestRenewLeaseOutsideTask(t *testing.T) {
+	if err := taskgate.RenewLease(context.Background()); !errors.Is(err, taskgate.ErrNoTask) {
+		t.Fatalf("非任务 ctx 调 RenewLease 应返回 ErrNoTask,实际: %v", err)
+	}
+}
+
+// TestManualHeartbeatShutdownTimeout 手动档的 Shutdown 超时路径与自动档完全一致:
+// handler 被打断后照常 Requeue 归还,三计数与 RunAt 全不动(不因没有心跳 goroutine 走样)。
+func TestManualHeartbeatShutdownTimeout(t *testing.T) {
+	forEachLocalBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"mstuck": {Workers: 1, ManualHeartbeat: true},
+			},
+		})
+		started := make(chan struct{})
+		g.Handle("mstuck", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			close(started)
+			<-ctx.Done() // 只听取消信号,自己绝不主动结束
+			return nil, ctx.Err()
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		id, err := g.Submit(ctx, "mstuck", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		runAtBefore := mustGet(t, g, id).RunAt
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("等待任务开跑超时")
+		}
+
+		sctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer cancel()
+		if err := g.Shutdown(sctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown 超时应返回 ctx 超时错误,得到: %v", err)
+		}
+
+		task := mustGet(t, g, id)
+		if task.Status != taskgate.StatusPending {
+			t.Fatalf("被打断的任务应回 pending,实际 %s", task.Status)
+		}
+		if task.Attempts != 0 || task.LeaseLost != 0 || task.Throttled != 0 {
+			t.Fatalf("Requeue 不占任何计数,实际 Attempts=%d LeaseLost=%d Throttled=%d",
+				task.Attempts, task.LeaseLost, task.Throttled)
+		}
+		if !task.RunAt.Equal(runAtBefore) {
+			t.Fatalf("Requeue 不动 RunAt,之前 %v,之后 %v", runAtBefore, task.RunAt)
+		}
+	})
+}

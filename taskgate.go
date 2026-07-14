@@ -124,6 +124,13 @@ type QueueConfig struct {
 	RPS      float64  `yaml:"rps" json:"rps"`             // 0 = 不限速
 	Burst    int      `yaml:"burst" json:"burst"`         // 0 时取 max(1, int(RPS))
 	LeaseTTL Duration `yaml:"lease_ttl" json:"lease_ttl"` // 0 补默认 60s
+	// ManualHeartbeat 手动续租开关。默认 false:scheduler 给每个在跑任务起自动心跳,
+	// 每 LeaseTTL/3 续租一次。true:不起自动心跳,handler 必须自己定期调
+	// taskgate.RenewLease 保活,否则租约到期会被 reaper 回收(LeaseLost+1)。
+	// 注意手动档下跨进程 Cancel 只能靠 handler 下一次 RenewLease 发现
+	// (返回 ErrTaskCanceled);handler 一直不续租,则由租约过期兜底回收。
+	// 本地 Cancel(同进程)不受影响,依然即时打断 handler 的 ctx。
+	ManualHeartbeat bool `yaml:"manual_heartbeat" json:"manual_heartbeat"`
 }
 
 // 零值补默认的取值,来自 data-model.md。
