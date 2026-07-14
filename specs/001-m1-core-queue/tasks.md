@@ -92,9 +92,9 @@
 
 **Independent Test**: 慢任务(3×LeaseTTL)零误回收;kill -9 后 LeaseLost=1 最终 completed。
 
-- [ ] T019 [US4] scheduler.go:每在跑任务心跳 goroutine(LeaseTTL/3 调 Heartbeat,收 ErrTaskCanceled 则 cancel 任务 ctx;收 ErrLeaseLost 则放弃结果)+ 全局 reaper goroutine(周期 min(各队列 LeaseTTL)/2 调 ReapExpired)
-- [ ] T020 [US4] integration_test.go 增加:毒任务 LeaseLost 封顶进 failed、慢任务自动续租不被误回收(fakeclock 推进)
-- [ ] T021 [US4] 写 `crash_test.go` 专项(`-short` 跳过):子进程模式跑 sqlite worker 处理中 kill -9 → 主进程重开同一 db,reaper 回收,LeaseLost=1,重跑 completed;"唤醒中途崩"(sqlitebroker 测试注入点:父 Ack 事务提交前 panic)→ 重启后子正常唤醒不丢
+- [X] T019 [US4] scheduler.go:每在跑任务心跳 goroutine(LeaseTTL/3 调 Heartbeat,收 ErrTaskCanceled 则 cancel 任务 ctx;收 ErrLeaseLost 则放弃结果)+ 全局 reaper goroutine(周期 min(各队列 LeaseTTL)/2 调 ReapExpired)
+- [X] T020 [US4] integration_test.go 增加:毒任务 LeaseLost 封顶进 failed、慢任务自动续租不被误回收(fakeclock 推进)
+- [X] T021 [US4] 写 `crash_test.go` 专项(`-short` 跳过):子进程模式跑 sqlite worker 处理中 kill -9 → 主进程重开同一 db,reaper 回收,LeaseLost=1,重跑 completed;"唤醒中途崩"(sqlitebroker 测试注入点:父 Ack 事务提交前 panic)→ 重启后子正常唤醒不丢(注入点只在 sqlitebroker 测试二进制可见,文件落位 sqlitebroker/crash_test.go)
 
 **Checkpoint**: SC-004 全部成立。
 
@@ -106,8 +106,8 @@
 
 **Independent Test**: A→B→C 流水线;fan-in;A 失败连锁取消。
 
-- [ ] T022 [US5] client.go Submit 接线 DependsOn/IgnoreParentFailure 选项(Enqueue 侧校验已在后端);Get 返回 DependsOn 供 handler 取父结果
-- [ ] T023 [US5] integration_test.go 增加:三级流水线(C handler 里 Get 父 Result)、fan-in(两父都完成才跑;IgnoreParentFailure 时父失败照跑)、提交时父已完成直接 pending、A 失败 B/C 连锁 canceled、DependsOn 不存在的父 → 拒收
+- [X] T022 [US5] client.go Submit 接线 DependsOn/IgnoreParentFailure 选项(Enqueue 侧校验已在后端);Get 返回 DependsOn 供 handler 取父结果(验证:Phase 1 已接通,无需改动)
+- [X] T023 [US5] integration_test.go 增加:三级流水线(C handler 里 Get 父 Result)、fan-in(两父都完成才跑;IgnoreParentFailure 时父失败照跑)、提交时父已完成直接 pending、A 失败 B/C 连锁 canceled、DependsOn 不存在的父 → 拒收(另补:流水线中途取消场景)
 
 **Checkpoint**: SC-005 流水线语义全链路成立。
 
@@ -117,8 +117,8 @@
 
 **Goal**: 各状态 Cancel 语义 + running 的 ctx 取消 + FinishCanceled 落库 + 传播。
 
-- [ ] T024 [US6] scheduler.go/client.go:Cancel 接线——本进程 running 任务保存 cancel func 即时 cancel;handler 退出后调 FinishCanceled;Wait 对 canceled 终态即时返回
-- [ ] T025 [US6] integration_test.go 增加:取消 running(handler ctx 被 cancel、终态 canceled)、取消 blocked 向下传播、终态 Cancel 报错
+- [X] T024 [US6] scheduler.go/client.go:Cancel 接线——本进程 running 任务保存 cancel func 即时 cancel;handler 退出后调 FinishCanceled;Wait 对 canceled 终态即时返回
+- [X] T025 [US6] integration_test.go 增加:取消 running(handler ctx 被 cancel、终态 canceled)、取消 blocked 向下传播、终态 Cancel 报错
 
 **Checkpoint**: US6 验收场景全绿。
 

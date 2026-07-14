@@ -151,6 +151,20 @@ func (g *Gate) Get(ctx context.Context, id string) (*Task, error) {
 	return g.broker.Get(ctx, id)
 }
 
+// Cancel 取消任务(US6):
+//   - blocked/pending/retrying:后端直接置 canceled 并向下传播(FailFast 子连锁取消);
+//   - running:后端只打取消标记,然后看任务是否正在本进程跑——在的话立即 cancel 它的
+//     handler ctx(不在本进程跑的,由持有它的进程下一次 Heartbeat 发现标记);
+//     handler 退出后 scheduler 调 FinishCanceled 落库 canceled;
+//   - 终态:返回 ErrAlreadyFinal;不存在:返回 ErrTaskNotFound。
+func (g *Gate) Cancel(ctx context.Context, id string) error {
+	if err := g.broker.Cancel(ctx, id); err != nil {
+		return err
+	}
+	g.sched.cancelLocal(id)
+	return nil
+}
+
 // List 按过滤条件列任务。
 func (g *Gate) List(ctx context.Context, f Filter) ([]*Task, error) {
 	return g.broker.List(ctx, f)

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ambrose/taskgate"
+	"github.com/ambrose/taskgate/internal/fakeclock"
 	"github.com/ambrose/taskgate/memorybroker"
 	"github.com/ambrose/taskgate/sqlitebroker"
 )
@@ -555,6 +556,544 @@ func TestThrottledCap(t *testing.T) {
 		}
 		if task.Attempts != 0 {
 			t.Fatalf("限流封顶不占 Attempts,应为 0,得到 %d", task.Attempts)
+		}
+	})
+}
+
+// ---------- Phase 6(US4):租约、reaper 与自动续租 ----------
+
+// TestPoisonTaskLeaseCap 毒任务:worker 认领后"进程假死"(不心跳、不回执)。
+// 绕过 scheduler 直接操作 Broker + fakeclock,循环 3 次"认领→租约过期→ReapExpired 回收",
+// LeaseLost 封顶(默认 3)后任务进 failed,LastError 用固定文案 "lease expired 3 times"。
+func TestPoisonTaskLeaseCap(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		clk := fakeclock.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err := b.Init(taskgate.BrokerOptions{
+			DefaultLeaseTTL: 200 * time.Millisecond,
+			LeaseLostMax:    3,
+			ThrottledMax:    100,
+			Clock:           clk,
+		}); err != nil {
+			t.Fatalf("Init 失败: %v", err)
+		}
+		ctx := context.Background()
+
+		poison := &taskgate.Task{ID: "poison-1", Type: "poison", Queue: "poison"}
+		if err := b.Enqueue(ctx, poison); err != nil {
+			t.Fatalf("Enqueue 失败: %v", err)
+		}
+
+		for i := 1; i <= 3; i++ {
+			claimed, err := b.Dequeue(ctx, []string{"poison"})
+			if err != nil {
+				t.Fatalf("第 %d 轮 Dequeue 失败: %v", i, err)
+			}
+			if claimed.ID != "poison-1" {
+				t.Fatalf("第 %d 轮认领到了别的任务: %s", i, claimed.ID)
+			}
+			// worker 假死:不心跳不回执,直接把时间推过租约期,让 reaper 回收。
+			clk.Advance(201 * time.Millisecond)
+			n, err := b.ReapExpired(ctx)
+			if err != nil || n != 1 {
+				t.Fatalf("第 %d 轮 ReapExpired 应回收 1 条,实际 n=%d err=%v", i, n, err)
+			}
+
+			got, err := b.Get(ctx, "poison-1")
+			if err != nil {
+				t.Fatalf("Get 失败: %v", err)
+			}
+			if got.LeaseLost != i {
+				t.Fatalf("第 %d 轮后 LeaseLost 应为 %d,实际 %d", i, i, got.LeaseLost)
+			}
+			if i < 3 {
+				if got.Status != taskgate.StatusPending {
+					t.Fatalf("第 %d 轮后应回 pending 等重跑,实际 %s", i, got.Status)
+				}
+				continue
+			}
+			// 第 3 次封顶:进 failed 死信,固定文案。
+			if got.Status != taskgate.StatusFailed {
+				t.Fatalf("封顶后应为 failed,实际 %s", got.Status)
+			}
+			if got.LastError != "lease expired 3 times" {
+				t.Fatalf("LastError 应为 %q,实际 %q", "lease expired 3 times", got.LastError)
+			}
+		}
+	})
+}
+
+// TestSlowTaskAutoRenew 慢任务自动续租:LeaseTTL=300ms,handler 真跑 3×TTL(900ms),
+// 期间心跳每 TTL/3 续租、reaper 每 TTL/2 在扫,任务全程不被误回收:
+// 最终 completed 且 LeaseLost=0(SC-004 的"零误回收")。
+func TestSlowTaskAutoRenew(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"slow": {Workers: 1, LeaseTTL: taskgate.Duration(300 * time.Millisecond)},
+			},
+		})
+		g.Handle("slow", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			time.Sleep(900 * time.Millisecond) // 3 倍租约时长,不续租必被回收
+			return []byte(`"survived"`), nil
+		})
+		startGate(t, g)
+
+		id, err := g.Submit(context.Background(), "slow", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, err := g.Wait(ctx, id)
+		if err != nil {
+			t.Fatalf("Wait 失败: %v", err)
+		}
+		if string(result) != `"survived"` {
+			t.Fatalf("Result 不对: %s", result)
+		}
+
+		task := mustGet(t, g, id)
+		if task.Status != taskgate.StatusCompleted {
+			t.Fatalf("状态应为 completed,实际 %s", task.Status)
+		}
+		if task.LeaseLost != 0 {
+			t.Fatalf("自动续租下不该被回收,LeaseLost 应为 0,实际 %d", task.LeaseLost)
+		}
+	})
+}
+
+// ---------- Phase 7(US5):任务依赖与流水线 ----------
+
+// TestPipelineThreeStages 三级流水线 A(summarize)→B(extract)→C(score):
+// 每级 handler 用 Get(task.DependsOn[0]) 读父任务的 Result,把字段拼进自己的结果,
+// 最终断言三级字段全部传递正确(SC-005)。
+func TestPipelineThreeStages(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"summarize": {Workers: 1},
+				"extract":   {Workers: 1},
+				"score":     {Workers: 1},
+			},
+		})
+		// mergeParent 读父结果、附加一个自己的字段再返回,模拟真实流水线的结果传递。
+		mergeParent := func(key, val string) taskgate.Handler {
+			return func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+				parent, err := g.Get(ctx, task.DependsOn[0])
+				if err != nil {
+					return nil, err
+				}
+				out := map[string]string{}
+				if err := json.Unmarshal(parent.Result, &out); err != nil {
+					return nil, err
+				}
+				out[key] = val
+				return json.Marshal(out)
+			}
+		}
+		g.Handle("summarize", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return json.Marshal(map[string]string{"summary": "S"})
+		})
+		g.Handle("extract", mergeParent("keywords", "K"))
+		g.Handle("score", mergeParent("score", "100"))
+		startGate(t, g)
+
+		ctx := context.Background()
+		aid, err := g.Submit(ctx, "summarize", nil)
+		if err != nil {
+			t.Fatalf("Submit A 失败: %v", err)
+		}
+		bid, err := g.Submit(ctx, "extract", nil, taskgate.DependsOn(aid))
+		if err != nil {
+			t.Fatalf("Submit B 失败: %v", err)
+		}
+		cid, err := g.Submit(ctx, "score", nil, taskgate.DependsOn(bid))
+		if err != nil {
+			t.Fatalf("Submit C 失败: %v", err)
+		}
+
+		wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		result, err := g.Wait(wctx, cid)
+		if err != nil {
+			t.Fatalf("Wait C 失败: %v", err)
+		}
+		var out map[string]string
+		if err := json.Unmarshal(result, &out); err != nil {
+			t.Fatalf("C 的结果不是合法 JSON: %s", result)
+		}
+		if out["summary"] != "S" || out["keywords"] != "K" || out["score"] != "100" {
+			t.Fatalf("三级字段传递不对: %s", result)
+		}
+	})
+}
+
+// TestFanInDependency fan-in:C 依赖 A+B 两个父,必须两个都完成才被唤醒。
+// 用一个放行 channel 卡住 B:A 先完成时断言 C 仍 blocked,放行 B 后 C 才跑。
+func TestFanInDependency(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"fast": {Workers: 1}, "gated": {Workers: 1}, "join": {Workers: 1},
+			},
+		})
+		releaseB := make(chan struct{})
+		g.Handle("fast", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return []byte(`"a"`), nil
+		})
+		g.Handle("gated", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			<-releaseB // 等测试放行
+			return []byte(`"b"`), nil
+		})
+		g.Handle("join", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return []byte(`"c"`), nil
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		aid, err := g.Submit(ctx, "fast", nil)
+		if err != nil {
+			t.Fatalf("Submit A 失败: %v", err)
+		}
+		bid, err := g.Submit(ctx, "gated", nil)
+		if err != nil {
+			t.Fatalf("Submit B 失败: %v", err)
+		}
+		cid, err := g.Submit(ctx, "join", nil, taskgate.DependsOn(aid, bid))
+		if err != nil {
+			t.Fatalf("Submit C 失败: %v", err)
+		}
+
+		// A 完成后 C 必须还卡在 blocked(B 没放行,fan-in 不能提前唤醒)。
+		waitFor(t, 5*time.Second, func() bool {
+			return mustGet(t, g, aid).Status == taskgate.StatusCompleted
+		}, "A 应先完成")
+		if got := mustGet(t, g, cid).Status; got != taskgate.StatusBlocked {
+			t.Fatalf("只完成一个父时 C 应仍 blocked,实际 %s", got)
+		}
+
+		close(releaseB)
+		wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if _, err := g.Wait(wctx, cid); err != nil {
+			t.Fatalf("两个父都完成后 C 应跑完,Wait 失败: %v", err)
+		}
+	})
+}
+
+// TestIgnoreParentFailure 父失败照跑:A 直接 failed,C 带 IgnoreParentFailure 依赖 A,
+// C 仍被唤醒并正常完成。
+func TestIgnoreParentFailure(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"boom": {Workers: 1}, "tolerant": {Workers: 1}},
+		})
+		g.Handle("boom", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return nil, taskgate.ErrSkipRetry{Err: errors.New("父任务注定失败")}
+		})
+		g.Handle("tolerant", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return []byte(`"still ran"`), nil
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		aid, err := g.Submit(ctx, "boom", nil)
+		if err != nil {
+			t.Fatalf("Submit A 失败: %v", err)
+		}
+		cid, err := g.Submit(ctx, "tolerant", nil,
+			taskgate.DependsOn(aid), taskgate.IgnoreParentFailure())
+		if err != nil {
+			t.Fatalf("Submit C 失败: %v", err)
+		}
+
+		wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		result, err := g.Wait(wctx, cid)
+		if err != nil {
+			t.Fatalf("IgnoreParentFailure 下 C 应照常跑完,Wait 失败: %v", err)
+		}
+		if string(result) != `"still ran"` {
+			t.Fatalf("C 的结果不对: %s", result)
+		}
+		if got := mustGet(t, g, aid).Status; got != taskgate.StatusFailed {
+			t.Fatalf("A 应为 failed,实际 %s", got)
+		}
+	})
+}
+
+// TestChildNotBlockedWhenParentDone 提交那一刻父已经 completed → 子直接 pending 入队,
+// 不卡 blocked(可能已被立刻认领跑完,所以只断言"非 blocked")。
+func TestChildNotBlockedWhenParentDone(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"step": {Workers: 1}},
+		})
+		g.Handle("step", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return []byte(`"ok"`), nil
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		aid, err := g.Submit(ctx, "step", nil)
+		if err != nil {
+			t.Fatalf("Submit A 失败: %v", err)
+		}
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if _, err := g.Wait(wctx, aid); err != nil {
+			t.Fatalf("Wait A 失败: %v", err)
+		}
+
+		// 父已终态,子必须直接可跑(pending/running/completed 都行,唯独不能 blocked)。
+		cid, err := g.Submit(ctx, "step", nil, taskgate.DependsOn(aid))
+		if err != nil {
+			t.Fatalf("Submit 子任务失败: %v", err)
+		}
+		if got := mustGet(t, g, cid).Status; got == taskgate.StatusBlocked {
+			t.Fatal("父已完成,子不应卡在 blocked")
+		}
+	})
+}
+
+// TestFailFastCascade A 失败 → B(默认 FailFast)连锁 canceled 且 LastError 记明原因,
+// B 的子任务 C 也逐层连锁 canceled(链式最终一致)。
+func TestFailFastCascade(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"src": {Workers: 1}, "mid": {Workers: 1}, "leaf": {Workers: 1},
+			},
+		})
+		g.Handle("src", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return nil, taskgate.ErrSkipRetry{Err: errors.New("boom")}
+		})
+
+		// 先把三级链全部提交好(B/C 都在 blocked),再开消费,保证走"运行期连锁取消"路径,
+		// 而不是"提交时父已失败"的直接判定路径。
+		ctx := context.Background()
+		aid, err := g.Submit(ctx, "src", nil)
+		if err != nil {
+			t.Fatalf("Submit A 失败: %v", err)
+		}
+		bid, err := g.Submit(ctx, "mid", nil, taskgate.DependsOn(aid))
+		if err != nil {
+			t.Fatalf("Submit B 失败: %v", err)
+		}
+		cid, err := g.Submit(ctx, "leaf", nil, taskgate.DependsOn(bid))
+		if err != nil {
+			t.Fatalf("Submit C 失败: %v", err)
+		}
+		startGate(t, g)
+
+		waitFor(t, 5*time.Second, func() bool {
+			return mustGet(t, g, cid).Status == taskgate.StatusCanceled
+		}, "C 应被连锁取消")
+
+		bt := mustGet(t, g, bid)
+		if bt.Status != taskgate.StatusCanceled {
+			t.Fatalf("B 应为 canceled,实际 %s", bt.Status)
+		}
+		if want := "parent " + aid + " failed"; bt.LastError != want {
+			t.Fatalf("B 的 LastError 应为 %q,实际 %q", want, bt.LastError)
+		}
+		if got := mustGet(t, g, aid).Status; got != taskgate.StatusFailed {
+			t.Fatalf("A 应为 failed,实际 %s", got)
+		}
+	})
+}
+
+// TestDependsOnMissingParent DependsOn 指向不存在的任务 → Submit 拒收,
+// 错误可用 errors.Is(ErrTaskNotFound) 判断(依赖无环靠这条提交校验)。
+func TestDependsOnMissingParent(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"step": {Workers: 1}},
+		})
+		_, err := g.Submit(context.Background(), "step", nil, taskgate.DependsOn("no-such-parent"))
+		if !errors.Is(err, taskgate.ErrTaskNotFound) {
+			t.Fatalf("父不存在应报 ErrTaskNotFound,实际: %v", err)
+		}
+	})
+}
+
+// TestCancelMidPipeline 流水线中途取消:A 已 completed、B 还在 pending 时 Cancel B →
+// B canceled,孙 C 连锁 canceled,A 保持 completed 不受影响。
+func TestCancelMidPipeline(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{
+				"head": {Workers: 1}, "mid": {Workers: 1}, "tail": {Workers: 1},
+			},
+		})
+		// 只消费 head:B 被父完成唤醒成 pending 后没人认领,停在可取消的位置。
+		g.Handle("head", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return []byte(`"a"`), nil
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		aid, err := g.Submit(ctx, "head", nil)
+		if err != nil {
+			t.Fatalf("Submit A 失败: %v", err)
+		}
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if _, err := g.Wait(wctx, aid); err != nil {
+			t.Fatalf("Wait A 失败: %v", err)
+		}
+		bid, err := g.Submit(ctx, "mid", nil, taskgate.DependsOn(aid))
+		if err != nil {
+			t.Fatalf("Submit B 失败: %v", err)
+		}
+		cid, err := g.Submit(ctx, "tail", nil, taskgate.DependsOn(bid))
+		if err != nil {
+			t.Fatalf("Submit C 失败: %v", err)
+		}
+		if got := mustGet(t, g, bid).Status; got != taskgate.StatusPending {
+			t.Fatalf("前置条件不成立:B 应为 pending,实际 %s", got)
+		}
+
+		if err := g.Cancel(ctx, bid); err != nil {
+			t.Fatalf("Cancel B 失败: %v", err)
+		}
+		if got := mustGet(t, g, bid).Status; got != taskgate.StatusCanceled {
+			t.Fatalf("B 应为 canceled,实际 %s", got)
+		}
+		waitFor(t, 5*time.Second, func() bool {
+			return mustGet(t, g, cid).Status == taskgate.StatusCanceled
+		}, "孙任务 C 应被连锁取消")
+		if got := mustGet(t, g, aid).Status; got != taskgate.StatusCompleted {
+			t.Fatalf("A 应保持 completed,实际 %s", got)
+		}
+	})
+}
+
+// ---------- Phase 8(US6):取消 ----------
+
+// TestCancelRunning 取消 running 任务:Cancel 后本进程 handler 的 ctx 立即被 cancel,
+// handler 退出后任务以 canceled 落库,Wait 返回 *TaskFailedError(Status=canceled)。
+func TestCancelRunning(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"long": {Workers: 1}},
+		})
+		started := make(chan struct{})
+		ctxCanceled := make(chan struct{})
+		g.Handle("long", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			close(started)
+			<-ctx.Done() // 老老实实听取消信号
+			close(ctxCanceled)
+			return nil, ctx.Err()
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		id, err := g.Submit(ctx, "long", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("等待 handler 开跑超时")
+		}
+
+		if err := g.Cancel(ctx, id); err != nil {
+			t.Fatalf("Cancel 失败: %v", err)
+		}
+		// handler 的 ctx 必须真的被 cancel(本进程即时路径,不用等 Heartbeat)。
+		select {
+		case <-ctxCanceled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Cancel 后 handler 的 ctx 应立即被取消")
+		}
+
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		_, err = g.Wait(wctx, id)
+		var tfe *taskgate.TaskFailedError
+		if !errors.As(err, &tfe) {
+			t.Fatalf("Wait 应返回 *TaskFailedError,实际: %v", err)
+		}
+		if tfe.Status != taskgate.StatusCanceled {
+			t.Fatalf("终态应为 canceled,实际 %s", tfe.Status)
+		}
+		if got := mustGet(t, g, id); got.Status != taskgate.StatusCanceled {
+			t.Fatalf("落库状态应为 canceled,实际 %s", got.Status)
+		}
+	})
+}
+
+// TestCancelBlockedPropagation 取消 blocked 任务向下传播:
+// 父还 pending 没人跑,子 blocked、孙 blocked;Cancel 子 → 子和孙都 canceled,父不动。
+func TestCancelBlockedPropagation(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		// 不起消费循环:父保持 pending,子孙保持 blocked,纯验证取消传播。
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"chain": {Workers: 1}},
+		})
+		ctx := context.Background()
+		pid, err := g.Submit(ctx, "chain", nil)
+		if err != nil {
+			t.Fatalf("Submit 父失败: %v", err)
+		}
+		cid, err := g.Submit(ctx, "chain", nil, taskgate.DependsOn(pid))
+		if err != nil {
+			t.Fatalf("Submit 子失败: %v", err)
+		}
+		gid, err := g.Submit(ctx, "chain", nil, taskgate.DependsOn(cid))
+		if err != nil {
+			t.Fatalf("Submit 孙失败: %v", err)
+		}
+		if got := mustGet(t, g, cid).Status; got != taskgate.StatusBlocked {
+			t.Fatalf("前置条件不成立:子应为 blocked,实际 %s", got)
+		}
+
+		if err := g.Cancel(ctx, cid); err != nil {
+			t.Fatalf("Cancel 子失败: %v", err)
+		}
+		if got := mustGet(t, g, cid).Status; got != taskgate.StatusCanceled {
+			t.Fatalf("子应为 canceled,实际 %s", got)
+		}
+		gt := mustGet(t, g, gid)
+		if gt.Status != taskgate.StatusCanceled {
+			t.Fatalf("孙应被连锁取消,实际 %s", gt.Status)
+		}
+		if want := "parent " + cid + " canceled"; gt.LastError != want {
+			t.Fatalf("孙的 LastError 应为 %q,实际 %q", want, gt.LastError)
+		}
+		if got := mustGet(t, g, pid).Status; got != taskgate.StatusPending {
+			t.Fatalf("父不受影响,应保持 pending,实际 %s", got)
+		}
+	})
+}
+
+// TestCancelFinalTask 终态任务再 Cancel → ErrAlreadyFinal。
+func TestCancelFinalTask(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"quick": {Workers: 1}},
+		})
+		g.Handle("quick", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			return []byte(`"done"`), nil
+		})
+		startGate(t, g)
+
+		ctx := context.Background()
+		id, err := g.Submit(ctx, "quick", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if _, err := g.Wait(wctx, id); err != nil {
+			t.Fatalf("Wait 失败: %v", err)
+		}
+
+		if err := g.Cancel(ctx, id); !errors.Is(err, taskgate.ErrAlreadyFinal) {
+			t.Fatalf("终态 Cancel 应报 ErrAlreadyFinal,实际: %v", err)
 		}
 	})
 }
