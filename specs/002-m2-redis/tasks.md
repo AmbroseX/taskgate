@@ -47,8 +47,8 @@
 
 **Goal**: 双进程不丢不重;kill -9 回收;断连恢复。
 
-- [ ] T108 [US2] `multiproc_test.go`(根包,-short 跳过):miniredis 起在父进程,子进程 exec 自身二进制(沿用 sqlitebroker/crash_test.go 哨兵模式)——① 双进程灌 1000 任务,handler 往 Redis 写执行记录,断言恰好 1000 条无重复;② 子进程认领后 kill -9,存活进程经 reaper 回收重跑,LeaseLost=1 最终 completed
-- [ ] T109 [US2] multiproc_test.go 增加断连恢复:miniredis 重启(Close/Restart 或新起同地址),worker 报错后重连继续消费,任务最终全 completed 不丢失
+- [x] T108 [US2] `multiproc_test.go`(根包,-short 跳过):miniredis 起在父进程,子进程 exec 自身二进制(沿用 sqlitebroker/crash_test.go 哨兵模式)——① 双进程灌 1000 任务,handler 往 Redis 写执行记录,断言恰好 1000 条无重复;② 子进程认领后 kill -9,存活进程经 reaper 回收重跑,LeaseLost=1 最终 completed
+- [x] T109 [US2] multiproc_test.go 增加断连恢复:miniredis 重启(Close/Restart 或新起同地址),worker 报错后重连继续消费,任务最终全 completed 不丢失
 
 **Checkpoint**: SC-002 成立。
 
