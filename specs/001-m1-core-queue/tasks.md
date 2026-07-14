@@ -21,11 +21,11 @@
 
 **Purpose**: 全部公共类型一次定型,后续任务只消费不改动。
 
-- [ ] T001 初始化 `go.mod`(module github.com/ambrose/taskgate,go 1.25)并写 `taskgate.go`:Task/Status 七态/canTransition 表/ParentFailurePolicy/Config/QueueConfig/Duration(UnmarshalText)/SubmitOption(WithID/Delay/RunAt/MaxRetry/DependsOn/IgnoreParentFailure)/Handler 类型,字段与默认值照 data-model.md 第 1 节
-- [ ] T002 [P] 写 `errors.go`:ErrTaskExists/ErrTaskNotFound/ErrLeaseLost/ErrTaskCanceled/ErrAlreadyFinal/ErrShutdown 哨兵 + ErrThrottled{RetryAfter}/ErrSkipRetry{Err} 错误类型(实现 error/Unwrap)
-- [ ] T003 [P] 写 `clock.go`(Clock 接口:Now/After/Sleep(ctx)/NewTicker,realClock 实现)与 `internal/fakeclock/fakeclock.go`(手动推进、唤醒 waiter,并发安全)
-- [ ] T004 写 `broker.go`:Broker 接口 + BrokerOptions + FailKind + Filter,签名一字不差照 contracts/broker-contract.md
-- [ ] T005 [P] 写 `taskgate_test.go`:L1 状态机表驱动全枚举(canTransition)、选项组合合法性、Config 校验规则单测(校验函数本体在 T001 的 validate 中)、Duration 解析
+- [X] T001 初始化 `go.mod`(module github.com/ambrose/taskgate,go 1.25)并写 `taskgate.go`:Task/Status 七态/canTransition 表/ParentFailurePolicy/Config/QueueConfig/Duration(UnmarshalText)/SubmitOption(WithID/Delay/RunAt/MaxRetry/DependsOn/IgnoreParentFailure)/Handler 类型,字段与默认值照 data-model.md 第 1 节
+- [X] T002 [P] 写 `errors.go`:ErrTaskExists/ErrTaskNotFound/ErrLeaseLost/ErrTaskCanceled/ErrAlreadyFinal/ErrShutdown 哨兵 + ErrThrottled{RetryAfter}/ErrSkipRetry{Err} 错误类型(实现 error/Unwrap)
+- [X] T003 [P] 写 `clock.go`(Clock 接口:Now/After/Sleep(ctx)/NewTicker,realClock 实现)与 `internal/fakeclock/fakeclock.go`(手动推进、唤醒 waiter,并发安全)
+- [X] T004 写 `broker.go`:Broker 接口 + BrokerOptions + FailKind + Filter,签名一字不差照 contracts/broker-contract.md
+- [X] T005 [P] 写 `taskgate_test.go`:L1 状态机表驱动全枚举(canTransition)、选项组合合法性、Config 校验规则单测(校验函数本体在 T001 的 validate 中)、Duration 解析
 
 **Checkpoint**: `go build ./...` 通过;L1 类型层测试绿。
 
