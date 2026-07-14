@@ -58,9 +58,9 @@
 
 **Goal**: 多进程共享 Workers/RPS 配额;崩溃槽自动回收。
 
-- [ ] T110 [US3] `redisbroker/lua/sem_acquire.lua` + `redisbroker/limiter.go`:zset 信号量(清过期→ZCARD<limit→ZADD;续期 goroutine LeaseTTL/3;Release=ZREM+停续期)+ redis_rate GCRA 的 WaitToken(被拒按 RetryAfter 挂 clock 等待;RPS=0 直通);实现 taskgate.QueueLimiter;Broker 实现 LimiterProvider;新依赖 redis_rate/v10
-- [ ] T111 [US3] `redisbroker/limiter_test.go` L1:同一 miniredis 上两个限流器实例 {Workers:2} 全局并发 ≤2;槽过期自动回收(fakeclock 推进);{RPS:10} 1 秒全局 10±2(真时钟短窗口);RPS=0 直通
-- [ ] T112 [US3] integration_test.go:后端参数化加 redis(miniredis)档跑全部既有 L3 场景;multiproc_test.go 增加双进程 {Workers:2} 全局并发 ≤2 的观测断言(handler 上报水位)
+- [x] T110 [US3] `redisbroker/lua/sem_acquire.lua` + `redisbroker/limiter.go`:zset 信号量(清过期→ZCARD<limit→ZADD;续期 goroutine LeaseTTL/3;Release=ZREM+停续期)+ redis_rate GCRA 的 WaitToken(被拒按 RetryAfter 挂 clock 等待;RPS=0 直通);实现 taskgate.QueueLimiter;Broker 实现 LimiterProvider;新依赖 redis_rate/v10
+- [x] T111 [US3] `redisbroker/limiter_test.go` L1:同一 miniredis 上两个限流器实例 {Workers:2} 全局并发 ≤2;槽过期自动回收(fakeclock 推进);{RPS:10} 1 秒全局 10±2(真时钟短窗口);RPS=0 直通
+- [x] T112 [US3] integration_test.go:后端参数化加 redis(miniredis)档跑全部既有 L3 场景;multiproc_test.go 增加双进程 {Workers:2} 全局并发 ≤2 的观测断言(handler 上报水位)
 
 **Checkpoint**: SC-003 成立;单机后端零回归。
 

@@ -1,4 +1,4 @@
-// integration_test.go L3 集成测试:走 Gate 公开 API 全链路,memory/sqlite 双后端参数化。
+// integration_test.go L3 集成测试:走 Gate 公开 API 全链路,memory/sqlite/redis 三后端参数化。
 // 这里用真时钟 + 短时长(毫秒级),有竞态风险的断言一律走 waitFor 轮询,不靠碰运气。
 package taskgate_test
 
@@ -13,13 +13,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+
 	"github.com/ambrose/taskgate"
 	"github.com/ambrose/taskgate/internal/fakeclock"
 	"github.com/ambrose/taskgate/memorybroker"
+	"github.com/ambrose/taskgate/redisbroker"
 	"github.com/ambrose/taskgate/sqlitebroker"
 )
 
-// backends 双后端参数化:同一个场景在 memory 和 sqlite 上都得绿。
+// backends 三后端参数化:同一个场景在 memory、sqlite、redis(miniredis)上都得绿。
+// 注意 redis 档不只是换存储:它实现了 LimiterProvider,限流场景走的是
+// 分布式限流器(zset 信号量 + redis_rate),L3 顺带盖住"单进程下分布式限流不回归"。
 var backends = []struct {
 	name string
 	make func(t *testing.T) taskgate.Broker
@@ -31,6 +36,14 @@ var backends = []struct {
 		b, err := sqlitebroker.Open(filepath.Join(t.TempDir(), "gate.db"))
 		if err != nil {
 			t.Fatalf("打开 sqlite 后端失败: %v", err)
+		}
+		return b
+	}},
+	{"redis", func(t *testing.T) taskgate.Broker {
+		mr := miniredis.RunT(t)
+		b, err := redisbroker.New(redisbroker.Options{Addr: mr.Addr()})
+		if err != nil {
+			t.Fatalf("打开 redis 后端失败: %v", err)
 		}
 		return b
 	}},

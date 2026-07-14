@@ -3,7 +3,9 @@
 //	① 双进程恰好一次:两个子进程 worker 抢同一批 1000 个任务,执行记录恰好 1000 条且每任务恰好 1 次;
 //	② kill -9 回收:子进程认领后被杀,新进程经 reaper 按租约过期回收重跑,LeaseLost=1 最终 completed;
 //	③ 断连恢复(T109):worker 经本地 TCP 代理连 Redis,掐断代理模拟网络断连,
-//	   恢复后消费循环自动续上,20 个任务全部 completed 不丢失。
+//	   恢复后消费循环自动续上,20 个任务全部 completed 不丢失;
+//	④ 并发配额全局共享(T112):双进程同队列 {Workers:2},handler 上报并发水位,
+//	   全局峰值恰好到 2 且从未超过 2。
 //
 // miniredis 起在父测试进程(它监听真实 TCP 端口,子进程连得上);"多进程"沿用
 // sqlitebroker/crash_test.go 的成熟模式:exec 自身测试二进制 + 环境变量开关 + 哨兵文件。
@@ -36,17 +38,23 @@ import (
 // 多进程专项的公共约定:任务类型 = 队列名 = "mp";
 // 执行记录写在 mpexec:<任务ID>(独立于 broker 的 tg: 前缀,互不干扰),
 // handler 每真正执行一次就 INCR 一次,父进程逐键断言"恰好一次"。
+// 并发水位专项(T112)另用三个键:mpconc 当前并发(INCR/DECR)、
+// mppeak2 并发确实到过 2 的证据、mpviol 超限违规标记。
 const (
 	mpQueue      = "mp"
 	mpExecPrefix = "mpexec:"
+	mpConcKey    = "mpconc"
+	mpPeakKey    = "mppeak2"
+	mpViolKey    = "mpviol"
+	mpConcLimit  = 2 // 并发水位专项的全局 Workers 上限
 )
 
-// mpConfig 多进程用例统一的 Gate 配置:单队列,8 并发,租约时长按用例传入。
-func mpConfig(b taskgate.Broker, ttl time.Duration) taskgate.Config {
+// mpConfig 多进程用例统一的 Gate 配置:单队列,并发数与租约时长按用例传入。
+func mpConfig(b taskgate.Broker, ttl time.Duration, workers int) taskgate.Config {
 	return taskgate.Config{
 		Broker: b,
 		Queues: map[string]taskgate.QueueConfig{
-			mpQueue: {Workers: 8, LeaseTTL: taskgate.Duration(ttl)},
+			mpQueue: {Workers: workers, LeaseTTL: taskgate.Duration(ttl)},
 		},
 	}
 }
@@ -56,7 +64,11 @@ func mpConfig(b taskgate.Broker, ttl time.Duration) taskgate.Config {
 //   - "run":正常 worker,handler 往 Redis INCR 执行记录后返回成功;
 //     后台监视全局 completed 数,达到 TASKGATE_MP_TOTAL 后 Shutdown 正常退出(退出码 0);
 //   - "stall":kill -9 用例的受害者,handler 写哨兵文件通知父进程"任务已认领开跑",
-//     然后 select{} 永久卡死,等着被父进程 kill -9。
+//     然后 select{} 永久卡死,等着被父进程 kill -9;
+//   - "conc":并发水位观察者(T112),行为同 "run",但 handler 进门先 INCR 当前并发数,
+//     超过 mpConcLimit 就写违规标记,停留一拍(制造真实的并发重叠窗口)再 DECR。
+//
+// 队列 Workers 数从 TASKGATE_MP_WORKERS 读(缺省 8),并发水位专项要压到 2。
 func TestMultiprocHelper(t *testing.T) {
 	if os.Getenv("TASKGATE_MP_HELPER") != "1" {
 		t.Skip("仅作为多进程专项的子进程 worker 运行")
@@ -67,13 +79,19 @@ func TestMultiprocHelper(t *testing.T) {
 	if addr == "" || err != nil {
 		t.Fatalf("子进程环境变量不全: addr=%q ttl=%v", addr, err)
 	}
+	workers := 8
+	if v := os.Getenv("TASKGATE_MP_WORKERS"); v != "" {
+		if workers, err = strconv.Atoi(v); err != nil {
+			t.Fatalf("TASKGATE_MP_WORKERS 无效: %v", err)
+		}
+	}
 
 	b, err := redisbroker.New(redisbroker.Options{Addr: addr})
 	if err != nil {
 		t.Fatalf("子进程连 Redis(%s) 失败: %v", addr, err)
 	}
 	defer func() { _ = b.Close() }()
-	g, err := taskgate.New(mpConfig(b, ttl))
+	g, err := taskgate.New(mpConfig(b, ttl, workers))
 	if err != nil {
 		t.Fatalf("子进程 New 失败: %v", err)
 	}
@@ -89,6 +107,25 @@ func TestMultiprocHelper(t *testing.T) {
 				return nil, err
 			}
 			select {} // 卡死:心跳还在续租,直到整个进程被 kill -9
+		}
+		if mode == "conc" {
+			// 全局当前并发 +1;INCR 原子且返回新值,两个进程看到的是同一个计数。
+			v, verr := rdb.Incr(ctx, mpConcKey).Result()
+			if verr != nil {
+				return nil, verr
+			}
+			if v >= mpConcLimit {
+				// 记下"确实并发到过上限":没有这个证据,"峰值 ≤2"可能只是串行跑出来的空话。
+				_ = rdb.Set(ctx, mpPeakKey, strconv.FormatInt(v, 10), 0).Err()
+			}
+			if v > mpConcLimit {
+				// 违规:全局并发超过 Workers 上限,写标记让父进程一票否决。
+				_ = rdb.Set(ctx, mpViolKey, strconv.FormatInt(v, 10), 0).Err()
+			}
+			time.Sleep(150 * time.Millisecond) // 停留一拍,让两个进程的执行窗口真实重叠
+			if derr := rdb.Decr(ctx, mpConcKey).Err(); derr != nil {
+				return nil, derr
+			}
 		}
 		if err := rdb.Incr(ctx, mpExecPrefix+task.ID).Err(); err != nil {
 			return nil, err
@@ -186,7 +223,7 @@ func TestMultiprocExactlyOnce(t *testing.T) {
 		t.Fatalf("生产者连 Redis 失败: %v", err)
 	}
 	t.Cleanup(func() { _ = pb.Close() })
-	pg, err := taskgate.New(mpConfig(pb, ttl))
+	pg, err := taskgate.New(mpConfig(pb, ttl, 8))
 	if err != nil {
 		t.Fatalf("New(生产者) 失败: %v", err)
 	}
@@ -263,7 +300,7 @@ func TestMultiprocKillRecovery(t *testing.T) {
 		t.Fatalf("生产者连 Redis 失败: %v", err)
 	}
 	t.Cleanup(func() { _ = pb.Close() })
-	pg, err := taskgate.New(mpConfig(pb, ttl))
+	pg, err := taskgate.New(mpConfig(pb, ttl, 8))
 	if err != nil {
 		t.Fatalf("New(生产者) 失败: %v", err)
 	}
@@ -300,6 +337,64 @@ func TestMultiprocKillRecovery(t *testing.T) {
 		t.Fatalf("任务应恰好执行 1 次,实际 v=%q err=%v", v, gerr)
 	}
 	b.waitOK(t)
+}
+
+// TestMultiprocWorkersLimit 双进程共享并发配额(T112,spec US3 / SC-003):
+// 队列 {Workers:2},两个子进程 worker 同抢——若限流是进程内的,全局最多能同时跑 4 个;
+// 分布式信号量下全局必须 ≤2。handler 用 INCR/DECR 维护全局"当前并发"计数:
+// 峰值超过 2 就写违规标记(mpviol),父进程一票否决;
+// 同时要求峰值确实到过 2(mppeak2),否则"≤2"可能只是串行跑出来的空话。
+func TestMultiprocWorkersLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short 模式跳过多进程专项")
+	}
+	mr := miniredis.RunT(t)
+
+	// 24 个任务 × 每个停留 150ms ÷ 全局 2 并发 ≈ 1.8s,时长可控;
+	// 租约给足 10s,正常路径不出现租约过期(理由同 TestMultiprocExactlyOnce)。
+	const total = 24
+	const ttl = 10 * time.Second
+
+	pb, err := redisbroker.New(redisbroker.Options{Addr: mr.Addr()})
+	if err != nil {
+		t.Fatalf("生产者连 Redis 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = pb.Close() })
+	pg, err := taskgate.New(mpConfig(pb, ttl, mpConcLimit))
+	if err != nil {
+		t.Fatalf("New(生产者) 失败: %v", err)
+	}
+	for i := 0; i < total; i++ {
+		if _, err := pg.Submit(context.Background(), mpQueue, nil); err != nil {
+			t.Fatalf("Submit 第 %d 个失败: %v", i, err)
+		}
+	}
+
+	// 两个子进程各配 Workers=2:配额是全局共享的,不是每进程各 2。
+	extra := []string{
+		"TASKGATE_MP_MODE=conc",
+		"TASKGATE_MP_TOTAL=" + strconv.Itoa(total),
+		"TASKGATE_MP_WORKERS=" + strconv.Itoa(mpConcLimit),
+	}
+	w1 := spawnWorker(t, mr.Addr(), ttl, extra...)
+	w2 := spawnWorker(t, mr.Addr(), ttl, extra...)
+
+	waitFor(t, 60*time.Second, func() bool {
+		counts, cerr := pg.Overview(context.Background())
+		return cerr == nil && counts[mpQueue][taskgate.StatusCompleted] == total
+	}, "24 个任务应全部 completed")
+
+	// 违规标记必须不存在:全局并发峰值从未超过 2。
+	if v, gerr := mr.Get(mpViolKey); gerr == nil {
+		t.Fatalf("全局并发超限:观察到峰值 %s(上限 %d)", v, mpConcLimit)
+	}
+	// 峰值证据必须存在:两个进程确实同时各跑过任务,断言不是串行空转出来的。
+	if _, gerr := mr.Get(mpPeakKey); gerr != nil {
+		t.Fatalf("并发从未达到 %d,测试没有真正压到并发窗口: %v", mpConcLimit, gerr)
+	}
+
+	w1.waitOK(t)
+	w2.waitOK(t)
 }
 
 // ---- T109 断连恢复:本地 TCP 代理精确模拟网络断连 ----
