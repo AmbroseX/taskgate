@@ -18,6 +18,8 @@ const (
 // rand.Rand 不是并发安全的,多个 worker 会同时算退避,这里用小锁护住。
 func newBackoffFunc(src rand.Source) func(n int) time.Duration {
 	if src == nil {
+		// time.Now() 在这里仅作随机种子,不参与任何时序逻辑,
+		// 不走注入 clock 属有意豁免。
 		src = rand.NewSource(time.Now().UnixNano())
 	}
 	rng := rand.New(src)

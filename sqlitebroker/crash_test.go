@@ -187,7 +187,9 @@ func TestWakeCrashRecoveryL3(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = b.Close() })
 
-	const ttl = 2 * time.Second // 租约给足 2s:崩溃点之后要来得及断言"父仍 running"
+	// 租约给足 10s:从 hookFired 到下面两条断言之间走的是真时钟,慢 CI 上若拖过租约,
+	// reaper 会提前回收父任务,"父仍 running"的断言就会误挂。断言窗口必须远大于调度抖动。
+	const ttl = 10 * time.Second
 	g, err := taskgate.New(taskgate.Config{
 		Broker: b,
 		Queues: map[string]taskgate.QueueConfig{
@@ -256,8 +258,8 @@ func TestWakeCrashRecoveryL3(t *testing.T) {
 		t.Fatalf("崩溃后子应仍 blocked,实际 %s", c.Status)
 	}
 
-	// 恢复:租约 2s 过期 → reaper(1s 一扫)回收父 → 重新认领重跑 → Ack 放行 → 子被唤醒跑完。
-	waitCond(t, 30*time.Second, func() bool {
+	// 恢复:租约 10s 过期 → reaper(TTL/2=5s 一扫)回收父 → 重新认领重跑 → Ack 放行 → 子被唤醒跑完。
+	waitCond(t, 60*time.Second, func() bool {
 		got, err := b.Get(ctx, cid)
 		return err == nil && got.Status == taskgate.StatusCompleted
 	}, "子任务应在父恢复重跑后被唤醒并跑完")

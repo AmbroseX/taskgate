@@ -12,6 +12,9 @@ import (
 // Ack 成功完结:completed + Result + FinishedAt,并在同一事务内唤醒子任务。
 // testHookBeforeAckCommit 在全部写入之后、提交之前触发(崩溃专项测试用,默认 nil)。
 func (b *Broker) Ack(ctx context.Context, id, leaseToken string, result []byte) error {
+	if err := b.requireInit(); err != nil {
+		return err
+	}
 	var notifs []taskgate.Task
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
 		r, err := getRec(ctx, tx, id)
@@ -57,6 +60,9 @@ func (b *Broker) Ack(ctx context.Context, id, leaseToken string, result []byte) 
 // Fail 失败路径:按 FailKind 动对应计数,封顶或耗尽进 failed(同事务连锁传播),
 // 否则进 retrying、RunAt=retryAt 到点重跑。
 func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind taskgate.FailKind, retryAt time.Time) error {
+	if err := b.requireInit(); err != nil {
+		return err
+	}
 	var notifs []taskgate.Task
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
 		r, err := getRec(ctx, tx, id)
@@ -136,6 +142,9 @@ func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind t
 // running 只打 cancel_requested 标记(终态由 FinishCanceled 落库);
 // 终态报 ErrAlreadyFinal,不存在报 ErrTaskNotFound。
 func (b *Broker) Cancel(ctx context.Context, id string) error {
+	if err := b.requireInit(); err != nil {
+		return err
+	}
 	var notifs []taskgate.Task
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
 		r, err := getRec(ctx, tx, id)
@@ -178,6 +187,9 @@ func (b *Broker) Cancel(ctx context.Context, id string) error {
 
 // FinishCanceled worker 响应取消后收尾:running → canceled 落库并同事务传播。
 func (b *Broker) FinishCanceled(ctx context.Context, id, leaseToken string) error {
+	if err := b.requireInit(); err != nil {
+		return err
+	}
 	var notifs []taskgate.Task
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
 		r, err := getRec(ctx, tx, id)
@@ -215,6 +227,9 @@ func (b *Broker) FinishCanceled(ctx context.Context, id, leaseToken string) erro
 // Requeue 优雅停机时归还任务:running → pending,三计数与 RunAt 全不动,
 // 清租约和取消标记。这不算失败,一个计数都不许占(合同要求)。
 func (b *Broker) Requeue(ctx context.Context, id, leaseToken string) error {
+	if err := b.requireInit(); err != nil {
+		return err
+	}
 	var notifs []taskgate.Task
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
 		r, err := getRec(ctx, tx, id)
@@ -248,6 +263,9 @@ func (b *Broker) Requeue(ctx context.Context, id, leaseToken string) error {
 // Heartbeat 续租:lease_until = now + TTL。发现取消标记时**续租照做**(先提交),
 // 再返回 ErrTaskCanceled 提醒 scheduler 去 cancel handler 的 ctx。
 func (b *Broker) Heartbeat(ctx context.Context, id, leaseToken string) error {
+	if err := b.requireInit(); err != nil {
+		return err
+	}
 	canceled := false
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
 		r, err := getRec(ctx, tx, id)

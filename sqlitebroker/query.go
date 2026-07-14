@@ -71,7 +71,7 @@ func (b *Broker) QueueLen(ctx context.Context, queue string) (int, error) {
 	return n, err
 }
 
-// Counts Type×Status 全矩阵,和逐个 Get 汇总必须一致(brokertest 验证)。
+// Counts 出现过的 Type×Status 稀疏矩阵,和逐个 Get 汇总必须一致(brokertest 验证)。
 func (b *Broker) Counts(ctx context.Context) (map[string]map[taskgate.Status]int64, error) {
 	rows, err := b.db.QueryContext(ctx, `SELECT type, status, COUNT(*) FROM tasks GROUP BY type, status`)
 	if err != nil {
@@ -96,7 +96,8 @@ func (b *Broker) Counts(ctx context.Context) (map[string]map[taskgate.Status]int
 }
 
 // ReapExpired 回收过期租约(lease_until < now 严格小于,压线不算过期):
-// 一条 UPDATE ... RETURNING 原子完成 LeaseLost+1、封顶进 failed(固定文案)或回 pending、
+// 带 cancel_requested=1 的过期任务直接落 canceled(不占 LeaseLost,触发传播),
+// 其余一条 UPDATE ... RETURNING 原子完成 LeaseLost+1、封顶进 failed(固定文案)或回 pending、
 // 清令牌;翻 failed 的行在同一事务内触发连锁传播。顺带做防御性修复:
 // blocked 但父实际全部终态的任务,按提交时同一套决策函数补唤醒/补取消
 // (这不是正常路径,是给"唤醒中途崩"这类事故兜底)。返回值只算租约回收条数。
@@ -109,6 +110,39 @@ func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
 		now := b.clk.Now()
 		nowMS := now.UnixMilli()
+
+		// 第零步:带取消标记的过期任务。用户已请求取消,而此刻租约过期、
+		// 没有任何 worker 持有它:直接落 canceled(不占 LeaseLost),
+		// 取消不能因为 worker 崩了就凭空丢失;同一事务内触发连锁传播。
+		canceledRows, err := tx.QueryContext(ctx, `UPDATE tasks SET
+				status = 'canceled', last_error = 'canceled', finished_at = ?1,
+				lease_token = '', lease_until = 0, cancel_requested = 0
+			WHERE status = 'running' AND lease_until < ?1 AND cancel_requested = 1
+			RETURNING `+taskCols, nowMS)
+		if err != nil {
+			return err
+		}
+		var reapedCanceled []*rec
+		for canceledRows.Next() {
+			r, err := scanRec(canceledRows)
+			if err != nil {
+				canceledRows.Close()
+				return err
+			}
+			reapedCanceled = append(reapedCanceled, r)
+		}
+		if err := canceledRows.Err(); err != nil {
+			canceledRows.Close()
+			return err
+		}
+		canceledRows.Close()
+		count += len(reapedCanceled)
+		for _, r := range reapedCanceled {
+			notifs = append(notifs, r.task)
+			if err := b.propagateTx(ctx, tx, r.task.ID, taskgate.StatusCanceled, now, &notifs); err != nil {
+				return err
+			}
+		}
 
 		// 第一步:一条 SQL 原子回收。SET 表达式全部基于旧值计算,先收集完再做后续写入。
 		rows, err := tx.QueryContext(ctx, `UPDATE tasks SET
@@ -137,7 +171,7 @@ func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
 			return err
 		}
 		rows.Close()
-		count = len(reaped)
+		count += len(reaped)
 		for _, r := range reaped {
 			notifs = append(notifs, r.task)
 			if r.task.Status == taskgate.StatusFailed {

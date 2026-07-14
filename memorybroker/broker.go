@@ -1,7 +1,7 @@
 // Package memorybroker 是 Broker 的内存参考实现:单进程、单 sync.Mutex + sync.Cond。
 // 它是三后端的"语义基准":所有状态流转都在同一个锁临界区内完成,
 // 等价于 sqlite 的"同一个事务"——终态更新和子任务唤醒天然原子,不可能丢唤醒。
-// brokertest 的 16 条契约以它的行为为准。
+// brokertest 的 17 条契约以它的行为为准。
 package memorybroker
 
 import (
@@ -90,6 +90,7 @@ func cloneTask(t *taskgate.Task) *taskgate.Task {
 }
 
 // fireNotify 在锁外异步触发状态流转回调,recover 包住:回调 panic 不能砸主流程(合同要求)。
+// 传入的快照必须是 cloneTask 的深拷贝:回调改快照不能污染存储,与 sqlite 后端行为一致。
 func (b *Broker) fireNotify(snaps []taskgate.Task) {
 	fn := b.opts.Notify
 	if fn == nil || len(snaps) == 0 {
@@ -154,12 +155,15 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		if err := b.requireInit(); err != nil {
 			return nil, err
 		}
-		if t.ID != "" {
-			if _, exists := b.recs[t.ID]; exists {
-				return nil, fmt.Errorf("%w: %s", taskgate.ErrTaskExists, t.ID)
+		// ID 先在局部变量里生成/使用:全部校验通过、落库成功后才回填 t.ID,
+		// 报错路径不能让调用方拿到一个根本不存在的孤儿 ID。
+		id := t.ID
+		if id != "" {
+			if _, exists := b.recs[id]; exists {
+				return nil, fmt.Errorf("%w: %s", taskgate.ErrTaskExists, id)
 			}
 		} else {
-			t.ID = ulid.Make().String()
+			id = ulid.Make().String()
 		}
 		now := b.clk.Now()
 
@@ -168,7 +172,7 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		for _, pid := range t.DependsOn {
 			p, ok := b.recs[pid]
 			if !ok {
-				return nil, fmt.Errorf("%w: parent %s (child %s)", taskgate.ErrTaskNotFound, pid, t.ID)
+				return nil, fmt.Errorf("%w: parent %s (child %s)", taskgate.ErrTaskNotFound, pid, id)
 			}
 			parents = append(parents, taskgate.ParentState{ID: pid, Status: p.task.Status})
 		}
@@ -179,6 +183,7 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		dec := taskgate.DecideOnSubmit(parents, policy)
 
 		rec := &record{task: *cloneTask(t), pendingParents: dec.PendingParents}
+		rec.task.ID = id
 		rec.task.Status = dec.Status
 		rec.task.OnParentFailure = policy
 		rec.task.CreatedAt = now
@@ -205,7 +210,7 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 
 		*t = *cloneTask(&rec.task) // 回填生成的 ID 与判定结果,调用方直接可用
 		b.cond.Broadcast()         // 可能有 Dequeue 正等着新任务
-		return []taskgate.Task{rec.task}, nil
+		return []taskgate.Task{*cloneTask(&rec.task)}, nil
 	}()
 	b.fireNotify(notifs)
 	return err
@@ -303,10 +308,10 @@ func (b *Broker) Dequeue(ctx context.Context, queues []string) (*taskgate.Task, 
 			if rec.task.StartedAt.IsZero() {
 				rec.task.StartedAt = now // 只记首次开跑
 			}
-			snap := rec.task
+			snap := cloneTask(&rec.task)
 			b.mu.Unlock()
-			b.fireNotify([]taskgate.Task{snap})
-			return cloneTask(&snap), nil
+			b.fireNotify([]taskgate.Task{*cloneTask(snap)})
+			return snap, nil
 		}
 		b.waitLocked(ctx, b.nextRunAt(qset, now), now)
 	}
@@ -331,7 +336,7 @@ func (b *Broker) propagateFinal(start *record, now time.Time, notifs *[]taskgate
 			switch action {
 			case taskgate.ChildWake:
 				if err := b.setStatus(c, taskgate.StatusPending); err == nil {
-					*notifs = append(*notifs, c.task)
+					*notifs = append(*notifs, *cloneTask(&c.task))
 				}
 			case taskgate.ChildCancel:
 				if c.task.Status == taskgate.StatusRunning {
@@ -343,7 +348,7 @@ func (b *Broker) propagateFinal(start *record, now time.Time, notifs *[]taskgate
 					c.task.LastError = taskgate.ParentFailureReason(p.task.ID, p.task.Status)
 					c.task.FinishedAt = now
 					clearLease(c)
-					*notifs = append(*notifs, c.task)
+					*notifs = append(*notifs, *cloneTask(&c.task))
 					work = append(work, c) // 链式:这个子也终态了,接着处理它的直接子任务
 				}
 			}
@@ -356,6 +361,9 @@ func (b *Broker) Ack(ctx context.Context, id, leaseToken string, result []byte) 
 	notifs, err := func() ([]taskgate.Task, error) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		if err := b.requireInit(); err != nil {
+			return nil, err
+		}
 		rec, err := b.checkLease(id, leaseToken)
 		if err != nil {
 			return nil, err
@@ -370,7 +378,7 @@ func (b *Broker) Ack(ctx context.Context, id, leaseToken string, result []byte) 
 		rec.task.FinishedAt = now
 		clearLease(rec)
 		rec.cancelRequested = false
-		notifs := []taskgate.Task{rec.task}
+		notifs := []taskgate.Task{*cloneTask(&rec.task)}
 		b.propagateFinal(rec, now, &notifs)
 		b.cond.Broadcast() // 被唤醒的子任务可能正被 Dequeue 等着
 		return notifs, nil
@@ -384,6 +392,9 @@ func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind t
 	notifs, err := func() ([]taskgate.Task, error) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		if err := b.requireInit(); err != nil {
+			return nil, err
+		}
 		rec, err := b.checkLease(id, leaseToken)
 		if err != nil {
 			return nil, err
@@ -417,7 +428,7 @@ func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind t
 			rec.task.FinishedAt = now
 			clearLease(rec)
 			rec.cancelRequested = false
-			notifs := []taskgate.Task{rec.task}
+			notifs := []taskgate.Task{*cloneTask(&rec.task)}
 			b.propagateFinal(rec, now, &notifs) // failed 也要在同一临界区里连锁处理子任务
 			b.cond.Broadcast()
 			return notifs, nil
@@ -433,7 +444,7 @@ func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind t
 		rec.task.RunAt = retryAt
 		clearLease(rec)
 		b.cond.Broadcast() // 让等待中的 Dequeue 重算下一个到点时刻
-		return []taskgate.Task{rec.task}, nil
+		return []taskgate.Task{*cloneTask(&rec.task)}, nil
 	}()
 	b.fireNotify(notifs)
 	return err
@@ -445,6 +456,9 @@ func (b *Broker) Cancel(ctx context.Context, id string) error {
 	notifs, err := func() ([]taskgate.Task, error) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		if err := b.requireInit(); err != nil {
+			return nil, err
+		}
 		rec, ok := b.recs[id]
 		if !ok {
 			return nil, fmt.Errorf("%w: %s", taskgate.ErrTaskNotFound, id)
@@ -463,7 +477,7 @@ func (b *Broker) Cancel(ctx context.Context, id string) error {
 		rec.task.LastError = "canceled"
 		rec.task.FinishedAt = now
 		clearLease(rec)
-		notifs := []taskgate.Task{rec.task}
+		notifs := []taskgate.Task{*cloneTask(&rec.task)}
 		b.propagateFinal(rec, now, &notifs) // 向下传播:FailFast 子连锁取消
 		b.cond.Broadcast()
 		return notifs, nil
@@ -477,6 +491,9 @@ func (b *Broker) FinishCanceled(ctx context.Context, id, leaseToken string) erro
 	notifs, err := func() ([]taskgate.Task, error) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		if err := b.requireInit(); err != nil {
+			return nil, err
+		}
 		rec, err := b.checkLease(id, leaseToken)
 		if err != nil {
 			return nil, err
@@ -489,7 +506,7 @@ func (b *Broker) FinishCanceled(ctx context.Context, id, leaseToken string) erro
 		rec.task.FinishedAt = now
 		clearLease(rec)
 		rec.cancelRequested = false
-		notifs := []taskgate.Task{rec.task}
+		notifs := []taskgate.Task{*cloneTask(&rec.task)}
 		b.propagateFinal(rec, now, &notifs)
 		b.cond.Broadcast()
 		return notifs, nil
@@ -504,6 +521,9 @@ func (b *Broker) Requeue(ctx context.Context, id, leaseToken string) error {
 	notifs, err := func() ([]taskgate.Task, error) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		if err := b.requireInit(); err != nil {
+			return nil, err
+		}
 		rec, err := b.checkLease(id, leaseToken)
 		if err != nil {
 			return nil, err
@@ -514,7 +534,7 @@ func (b *Broker) Requeue(ctx context.Context, id, leaseToken string) error {
 		clearLease(rec)
 		rec.cancelRequested = false
 		b.cond.Broadcast()
-		return []taskgate.Task{rec.task}, nil
+		return []taskgate.Task{*cloneTask(&rec.task)}, nil
 	}()
 	b.fireNotify(notifs)
 	return err
@@ -525,6 +545,9 @@ func (b *Broker) Requeue(ctx context.Context, id, leaseToken string) error {
 func (b *Broker) Heartbeat(ctx context.Context, id, leaseToken string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if err := b.requireInit(); err != nil {
+		return err
+	}
 	rec, err := b.checkLease(id, leaseToken)
 	if err != nil {
 		return err
@@ -591,7 +614,7 @@ func (b *Broker) QueueLen(ctx context.Context, queue string) (int, error) {
 	return n, nil
 }
 
-// Counts Type×Status 全矩阵,和逐个 Get 汇总必须一致(brokertest 验证)。
+// Counts 出现过的 Type×Status 稀疏矩阵,和逐个 Get 汇总必须一致(brokertest 验证)。
 func (b *Broker) Counts(ctx context.Context) (map[string]map[taskgate.Status]int64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -607,7 +630,8 @@ func (b *Broker) Counts(ctx context.Context) (map[string]map[taskgate.Status]int
 	return out, nil
 }
 
-// ReapExpired 回收过期租约:LeaseLost+1,封顶进 failed(触发传播),否则回 pending。
+// ReapExpired 回收过期租约:带取消标记的直接落 canceled(不占 LeaseLost,触发传播);
+// 其余 LeaseLost+1,封顶进 failed(触发传播),否则回 pending。
 // 顺带做防御性修复:blocked 但父实际全部终态的任务,按正常规则补唤醒/补取消
 // (这不是正常路径,是给"唤醒中途崩"这类事故兜底)。返回值只算租约回收条数。
 func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
@@ -626,6 +650,21 @@ func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
 			if rec.task.Status != taskgate.StatusRunning || !rec.leaseUntil.Before(now) {
 				continue
 			}
+			if rec.cancelRequested {
+				// 用户已请求取消,而此刻租约过期、没有任何 worker 持有它:
+				// 直接落 canceled(不占 LeaseLost),取消不能因为 worker 崩了就凭空丢失。
+				if err := b.setStatus(rec, taskgate.StatusCanceled); err != nil {
+					return count, notifs, err
+				}
+				rec.task.LastError = "canceled"
+				rec.task.FinishedAt = now
+				clearLease(rec)
+				rec.cancelRequested = false
+				notifs = append(notifs, *cloneTask(&rec.task))
+				b.propagateFinal(rec, now, &notifs) // canceled 同样要连锁处理子任务
+				count++
+				continue
+			}
 			rec.task.LeaseLost++
 			clearLease(rec)
 			rec.cancelRequested = false
@@ -635,13 +674,13 @@ func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
 				}
 				rec.task.LastError = fmt.Sprintf("lease expired %d times", rec.task.LeaseLost)
 				rec.task.FinishedAt = now
-				notifs = append(notifs, rec.task)
+				notifs = append(notifs, *cloneTask(&rec.task))
 				b.propagateFinal(rec, now, &notifs) // 封顶 failed 同样要连锁处理子任务
 			} else {
 				if err := b.setStatus(rec, taskgate.StatusPending); err != nil {
 					return count, notifs, err
 				}
-				notifs = append(notifs, rec.task)
+				notifs = append(notifs, *cloneTask(&rec.task))
 			}
 			count++
 		}
@@ -669,13 +708,13 @@ func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
 			case taskgate.StatusPending:
 				if err := b.setStatus(rec, taskgate.StatusPending); err == nil {
 					rec.pendingParents = 0
-					notifs = append(notifs, rec.task)
+					notifs = append(notifs, *cloneTask(&rec.task))
 				}
 			case taskgate.StatusCanceled:
 				if err := b.setStatus(rec, taskgate.StatusCanceled); err == nil {
 					rec.task.LastError = dec.LastError
 					rec.task.FinishedAt = now
-					notifs = append(notifs, rec.task)
+					notifs = append(notifs, *cloneTask(&rec.task))
 					b.propagateFinal(rec, now, &notifs)
 				}
 			default:

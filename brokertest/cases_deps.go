@@ -51,6 +51,16 @@ func caseDepWake(t *testing.T, h *harness) {
 		t.Fatalf("DependsOn 指向不存在的父任务应拒收(ErrTaskNotFound),实际 %v", err)
 	}
 
+	// 报错路径不得泄漏生成的 ID:空 ID 入队失败后,调用方的 t.ID 必须保持为空,
+	// 否则调用方会拿着一个根本不存在的孤儿 ID 去查任务。
+	noID := dependsOn("", "llm", "q", "no-such-parent")
+	if err := h.b.Enqueue(context.Background(), noID); !errors.Is(err, taskgate.ErrTaskNotFound) {
+		t.Fatalf("空 ID + 父不存在应拒收(ErrTaskNotFound),实际 %v", err)
+	}
+	if noID.ID != "" {
+		t.Fatalf("Enqueue 失败后不得把生成的 ID 回填给调用方,实际泄漏了 %q", noID.ID)
+	}
+
 	// 基本唤醒:子在父完成前是 blocked 且不可认领;父 Ack 后,
 	// 阻塞在子队列上的 Dequeue 必须被唤醒(证明"终态+唤醒"对认领方立即可见)。
 	h.enqueue(t, task("p", "ocr", "qp"))
@@ -201,4 +211,31 @@ func caseCancelStates(t *testing.T, h *harness) {
 	if err := h.b.Cancel(ctx, "rn"); !errors.Is(err, taskgate.ErrAlreadyFinal) {
 		t.Fatalf("Cancel(canceled) 应返回 ErrAlreadyFinal,实际 %v", err)
 	}
+
+	// running 被请求取消后 worker 崩了(不心跳):租约过期时 ReapExpired 必须把它
+	// 落成 canceled(不占 LeaseLost)并向下传播,取消请求不能凭空丢失。
+	h.enqueue(t, task("rp", "llm", "q-rp"))
+	h.enqueue(t, dependsOn("rp-child", "llm", "q-rp2", "rp"))
+	h.dequeue(t, "q-rp")
+	if err := h.b.Cancel(ctx, "rp"); err != nil {
+		t.Fatalf("Cancel(running) 应打标记并返回 nil,实际 %v", err)
+	}
+	h.advance(61 * time.Second) // 过 TTL(60s),模拟 worker 崩溃后不再心跳
+	if n, err := h.b.ReapExpired(ctx); err != nil || n != 1 {
+		t.Fatalf("带取消标记的过期任务应被回收 1 条,实际 n=%d err=%v", n, err)
+	}
+	got = h.mustStatus(t, "rp", taskgate.StatusCanceled)
+	if got.LeaseLost != 0 {
+		t.Fatalf("带取消标记的过期任务直接落 canceled,不占 LeaseLost,实际 %d", got.LeaseLost)
+	}
+	if got.FinishedAt.IsZero() {
+		t.Fatal("ReapExpired 落 canceled 应写 FinishedAt")
+	}
+	child = h.mustStatus(t, "rp-child", taskgate.StatusCanceled)
+	if child.LastError != "parent rp canceled" {
+		t.Fatalf("Reap 落 canceled 后应向下传播,子任务 LastError 应为 %q,实际 %q",
+			"parent rp canceled", child.LastError)
+	}
+	// 过期后 Dequeue 不得再认领到它(已是终态)。
+	h.expectBlocked(t, "q-rp")
 }

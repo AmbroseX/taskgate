@@ -518,6 +518,49 @@ func TestSkipRetry(t *testing.T) {
 	})
 }
 
+// TestSkipRetryWrapsThrottled ErrSkipRetry 里包着 ErrThrottled 时,
+// "明确不重试"必须赢:任务直接 failed,不许穿透匹配到内层限流走延后重排。
+func TestSkipRetryWrapsThrottled(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"strict": {Workers: 1}},
+		})
+		var calls atomic.Int32
+		g.Handle("strict", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			calls.Add(1)
+			return nil, taskgate.ErrSkipRetry{Err: taskgate.ErrThrottled{RetryAfter: time.Second}}
+		})
+		startGate(t, g)
+
+		id, err := g.Submit(context.Background(), "strict", nil, taskgate.MaxRetry(5))
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err = g.Wait(ctx, id)
+		var tfe *taskgate.TaskFailedError
+		if !errors.As(err, &tfe) {
+			t.Fatalf("Wait 应返回 *TaskFailedError,得到: %v", err)
+		}
+		if tfe.Status != taskgate.StatusFailed {
+			t.Fatalf("终态应为 failed,得到 %s", tfe.Status)
+		}
+
+		task := mustGet(t, g, id)
+		if task.Status != taskgate.StatusFailed {
+			t.Fatalf("状态应为 failed,得到 %s", task.Status)
+		}
+		if task.Throttled != 0 {
+			t.Fatalf("不该走限流重排,Throttled 应为 0,得到 %d", task.Throttled)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("handler 只该执行 1 次,实际 %d", got)
+		}
+	})
+}
+
 // TestThrottledCap ThrottledMax=2 封顶:第 2 次 ErrThrottled 就进 failed,
 // LastError 用固定文案 "throttled 2 times"。
 func TestThrottledCap(t *testing.T) {

@@ -54,7 +54,7 @@
 
 **Why this priority**: LLM 场景"网关 busy 等重试"与"真失败"必须区分,这是方案的核心特化。
 
-**Independent Test**: handler 前 2 次返回 error 第 3 次成功 → Attempts=3 最终 completed;返回 ErrThrottled{1s} 3 次 → Attempts 不涨、RunAt 每次 +1s、最终成功。
+**Independent Test**: handler 前 2 次返回 error 第 3 次成功 → Attempts=2(Attempts 只记业务失败次数,成功那次不算)最终 completed;返回 ErrThrottled{1s} 3 次 → Attempts 不涨、RunAt 每次 +1s、最终成功。
 
 **Acceptance Scenarios**:
 
@@ -147,7 +147,7 @@
 - **FR-001**: 库必须提供统一入口 `New(Config)`,Config 含 Broker、Queues(每队列 {Workers,RPS,Burst,LeaseTTL})、Routes(Type→Queue)、DefaultQueue;New 时校验配置 fail fast。
 - **FR-002**: 可序列化配置字段必须带 json/yaml tag;Broker/回调等注入字段打 `yaml:"-"`;提供带 UnmarshalText 的 Duration 类型;库自身禁止读 env 或配置文件。
 - **FR-003**: 任务必带 Type;队列名默认等于 Type,Routes 可显式改写;Queue 在入队那一刻定死。
-- **FR-004**: 库必须提供 Submit/Get/Cancel/List/Stats/Overview/Wait/Handle/Run/Shutdown 公开 API 及 WithID/Delay/RunAt/MaxRetry/DependsOn/FailFast/IgnoreParentFailure 提交选项。
+- **FR-004**: 库必须提供 Submit/Get/Cancel/List/Stats/Overview/Wait/Handle/Run/Shutdown 公开 API 及 WithID/Delay/RunAt/MaxRetry/DependsOn/IgnoreParentFailure 提交选项(FailFast 为默认策略,不提供选项,仅 IgnoreParentFailure 可选)。
 - **FR-005**: Task 模型含 ID(ulid,可自定义)、Type、Queue、Payload、Status、Result、LastError、Attempts、MaxRetry、LeaseLost、Throttled、RunAt、DependsOn、CreatedAt/StartedAt/FinishedAt;Payload/Result 为 json.RawMessage。
 - **FR-006**: 状态机固定为 blocked/pending/running/retrying/completed/failed/canceled 七态,非法流转拒绝。
 - **FR-007**: Broker 接口一次定型:Enqueue/Dequeue/Ack/Fail/Cancel/FinishCanceled/Requeue/Heartbeat/Get/List/QueueLen/Counts/ReapExpired/Close;Ack/Fail/FinishCanceled/Requeue/Heartbeat 必须带租约令牌,令牌不符返回 ErrLeaseLost。
@@ -161,7 +161,7 @@
 - **FR-015**: Shutdown:停止出队→等待在跑任务→超时 cancel ctx→Requeue 归还不占计数。
 - **FR-016**: OnStateChange 注册口 M1 暴露,同进程回调,默认空实现,回调异常不影响主流程。
 - **FR-017**: 对外错误必须是导出的哨兵错误/错误类型:ErrTaskExists、ErrLeaseLost、ErrThrottled{RetryAfter}、ErrSkipRetry、ErrTaskNotFound 等。
-- **FR-018**: 时间相关逻辑(租约、退避、限流)必须走可注入的 clock,测试不真 sleep。
+- **FR-018**: 时间相关逻辑(租约、退避、限流)必须走可注入的 clock,测试不真 sleep。例外:RPS 令牌桶用 x/time/rate,内部为真时钟,是唯一豁免(宪法技术栈指定该库);限流精度测试允许真时间短窗口。
 
 ### Key Entities
 

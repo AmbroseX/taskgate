@@ -67,6 +67,8 @@ return nil, taskgate.ErrSkipRetry{Err: err}                     // 没救的错:
 return nil, err                                                 // 普通业务失败:指数退避重试
 ```
 
+注意:ErrThrottled/ErrSkipRetry 必须按值返回(errors.As 按值匹配),不要返回其指针。
+
 提交选项:`WithID`(幂等去重)、`Delay` / `RunAt`(延迟执行)、`MaxRetry`、`DependsOn`、`IgnoreParentFailure`。
 
 ## Config 说明

@@ -26,6 +26,7 @@ var (
 
 // ErrThrottled handler 返回它表示"被网关限流了,过 RetryAfter 再来":
 // 不占 Attempts,只涨 Throttled 计数,封顶(默认 100)才进 failed。
+// 必须按值返回(errors.As 按值匹配),不要返回其指针。
 type ErrThrottled struct {
 	RetryAfter time.Duration
 }
@@ -36,6 +37,7 @@ func (e ErrThrottled) Error() string {
 }
 
 // ErrSkipRetry handler 返回它表示"这个错没救,别重试了",任务直接进 failed。
+// 必须按值返回(errors.As 按值匹配),不要返回其指针。
 type ErrSkipRetry struct {
 	Err error
 }

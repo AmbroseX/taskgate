@@ -215,6 +215,26 @@ func caseStaleToken(t *testing.T, h *harness) {
 	if err := h.b.Ack(ctx, "st", fresh.LeaseToken, nil); err != nil {
 		t.Fatalf("新令牌 Ack 应成功,实际 %v", err)
 	}
+
+	// 空字符串令牌:对一个从未认领的 pending 任务(存储里 lease_token 就是 "")
+	// 用 token="" 调写操作,必须 ErrLeaseLost 而不是"空串匹配空串"混过去。
+	h.enqueue(t, task("st-idle", "llm", "q-idle"))
+	emptyChecks := []struct {
+		op  string
+		err error
+	}{
+		{"Ack", h.b.Ack(ctx, "st-idle", "", nil)},
+		{"Fail", h.b.Fail(ctx, "st-idle", "", "x", taskgate.FailBusiness, h.now())},
+		{"Heartbeat", h.b.Heartbeat(ctx, "st-idle", "")},
+		{"Requeue", h.b.Requeue(ctx, "st-idle", "")},
+		{"FinishCanceled", h.b.FinishCanceled(ctx, "st-idle", "")},
+	}
+	for _, c := range emptyChecks {
+		if !errors.Is(c.err, taskgate.ErrLeaseLost) {
+			t.Fatalf("空令牌 %s 应返回 ErrLeaseLost,实际 %v", c.op, c.err)
+		}
+	}
+	h.mustStatus(t, "st-idle", taskgate.StatusPending) // 任务必须原封不动
 }
 
 // 契约 9 RetryingReclaim:retrying 到点后可被重新认领。

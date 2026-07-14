@@ -19,17 +19,20 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	}
 	var stored taskgate.Task
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
-		if t.ID != "" {
+		// ID 先在局部变量里生成/使用:全部校验通过、落库成功后才回填 t.ID,
+		// 报错路径不能让调用方拿到一个根本不存在的孤儿 ID。
+		id := t.ID
+		if id != "" {
 			var one int
-			err := tx.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id = ?`, t.ID).Scan(&one)
+			err := tx.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id = ?`, id).Scan(&one)
 			if err == nil {
-				return fmt.Errorf("%w: %s", taskgate.ErrTaskExists, t.ID)
+				return fmt.Errorf("%w: %s", taskgate.ErrTaskExists, id)
 			}
 			if !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
 		} else {
-			t.ID = ulid.Make().String()
+			id = ulid.Make().String()
 		}
 		now := b.clk.Now()
 
@@ -46,7 +49,7 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 			var st string
 			err := tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, pid).Scan(&st)
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("%w: parent %s (child %s)", taskgate.ErrTaskNotFound, pid, t.ID)
+				return fmt.Errorf("%w: parent %s (child %s)", taskgate.ErrTaskNotFound, pid, id)
 			}
 			if err != nil {
 				return err
@@ -61,6 +64,7 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		dec := taskgate.DecideOnSubmit(parents, policy)
 
 		stored = *t
+		stored.ID = id
 		stored.Status = dec.Status
 		stored.OnParentFailure = policy
 		stored.CreatedAt = now

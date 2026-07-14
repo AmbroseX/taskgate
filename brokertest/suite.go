@@ -1,5 +1,5 @@
 // Package brokertest 是 Broker 行为契约的统一验收套件。
-// memory/sqlite/redis 三个后端跑同一套 16 条契约用例(见 contracts/broker-contract.md),
+// memory/sqlite/redis 三个后端跑同一套 17 条契约用例(见 contracts/broker-contract.md),
 // 用例只断言语义、不断言实现手段:后端用轮询还是 Cond 唤醒都算合法,只要行为对。
 // 时间一律用 fakeclock 手动推进,禁止真 sleep;唯一的例外是阻塞语义用例里
 // 等 goroutine 结果的短观察窗,并且全部带超时保护。
@@ -33,34 +33,37 @@ const (
 )
 
 // contractCase 一条契约用例:名字 + 可选的选项微调 + 用例体。
+// notify=true 的用例会在构造 broker 前给选项装上 Notify 收集器(挂到 harness.notify)。
 type contractCase struct {
-	name string
-	tune func(*taskgate.BrokerOptions) // nil = 用默认选项
-	run  func(t *testing.T, h *harness)
+	name   string
+	tune   func(*taskgate.BrokerOptions) // nil = 用默认选项
+	run    func(t *testing.T, h *harness)
+	notify bool
 }
 
-// allCases 16 条契约,顺序与 contracts/broker-contract.md 的清单一致。
+// allCases 17 条契约,顺序与 contracts/broker-contract.md 的清单一致。
 var allCases = []contractCase{
-	{"RoundTrip", nil, caseRoundTrip},
-	{"IdempotentID", nil, caseIdempotentID},
-	{"ClaimMutex", nil, caseClaimMutex},
-	{"BlockingDequeue", nil, caseBlockingDequeue},
-	{"DelayedTask", nil, caseDelayedTask},
+	{name: "RoundTrip", run: caseRoundTrip},
+	{name: "IdempotentID", run: caseIdempotentID},
+	{name: "ClaimMutex", run: caseClaimMutex},
+	{name: "BlockingDequeue", run: caseBlockingDequeue},
+	{name: "DelayedTask", run: caseDelayedTask},
 	// Throttled 封顶要真实触发,默认 100 次太啰嗦,调小到 3。
-	{"AckFail", func(o *taskgate.BrokerOptions) { o.ThrottledMax = 3 }, caseAckFail},
-	{"LeaseReap", nil, caseLeaseReap},
-	{"StaleToken", nil, caseStaleToken},
-	{"RetryingReclaim", nil, caseRetryingReclaim},
-	{"DepWake", nil, caseDepWake},
-	{"CascadeCancel", nil, caseCascadeCancel},
-	{"CancelStates", nil, caseCancelStates},
-	{"CountsConsistency", nil, caseCountsConsistency},
-	{"ListFilter", nil, caseListFilter},
-	{"RequeueNoCount", nil, caseRequeueNoCount},
-	{"IllegalTransition", nil, caseIllegalTransition},
+	{name: "AckFail", tune: func(o *taskgate.BrokerOptions) { o.ThrottledMax = 3 }, run: caseAckFail},
+	{name: "LeaseReap", run: caseLeaseReap},
+	{name: "StaleToken", run: caseStaleToken},
+	{name: "RetryingReclaim", run: caseRetryingReclaim},
+	{name: "DepWake", run: caseDepWake},
+	{name: "CascadeCancel", run: caseCascadeCancel},
+	{name: "CancelStates", run: caseCancelStates},
+	{name: "CountsConsistency", run: caseCountsConsistency},
+	{name: "ListFilter", run: caseListFilter},
+	{name: "RequeueNoCount", run: caseRequeueNoCount},
+	{name: "IllegalTransition", run: caseIllegalTransition},
+	{name: "Notify", run: caseNotify, notify: true},
 }
 
-// Run 对 factory 构造的后端跑全部 16 条契约。这是所有后端的统一验收入口:
+// Run 对 factory 构造的后端跑全部 17 条契约。这是所有后端的统一验收入口:
 // 后端测试文件里一行 brokertest.Run(t, factory) 即接入。
 func Run(t *testing.T, factory Factory) {
 	for _, c := range allCases {
@@ -75,20 +78,27 @@ func Run(t *testing.T, factory Factory) {
 			if c.tune != nil {
 				c.tune(&opts)
 			}
+			h := &harness{clk: clk}
+			if c.notify {
+				h.notify = &notifyCollector{}
+				opts.Notify = h.notify.record
+			}
 			b := factory(t, opts)
 			if b == nil {
 				t.Fatal("factory 返回了 nil broker:必须返回一个已 Init 的空 broker")
 			}
 			t.Cleanup(func() { _ = b.Close() })
-			c.run(t, &harness{b: b, clk: clk})
+			h.b = b
+			c.run(t, h)
 		})
 	}
 }
 
-// harness 一条用例的运行环境:broker + 它专属的假时钟。
+// harness 一条用例的运行环境:broker + 它专属的假时钟(+ 可选的 Notify 收集器)。
 type harness struct {
-	b   taskgate.Broker
-	clk *fakeclock.Clock
+	b      taskgate.Broker
+	clk    *fakeclock.Clock
+	notify *notifyCollector // 仅 notify=true 的用例非 nil
 }
 
 // advance 推进假时间。所有"过了多久"一律走这里,不真 sleep。

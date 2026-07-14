@@ -133,7 +133,7 @@ CREATE INDEX IF NOT EXISTS idx_deps_parent ON task_deps(parent_id, done);
 ### 关键 SQL
 
 - **认领**(BEGIN IMMEDIATE 事务):research.md 第 1 节的子查询 UPDATE ... RETURNING。
-- **终态+唤醒**(同事务):① UPDATE 父任务终态;② `UPDATE task_deps SET done=1 WHERE parent_id=?`;③ completed 时 `UPDATE tasks SET pending_parents=pending_parents-1 WHERE id IN (SELECT child_id ...) AND pending_parents>0`,再 `UPDATE tasks SET status='pending' WHERE ... pending_parents=0 AND status='blocked'`;failed/canceled 且 FailFast 时把直接子任务翻 canceled(其孙由后续链式事务处理,每层一个事务)。
+- **终态+唤醒**(同事务):① UPDATE 父任务终态;② `UPDATE task_deps SET done=1 WHERE parent_id=?`;③ completed 时 `UPDATE tasks SET pending_parents=pending_parents-1 WHERE id IN (SELECT child_id ...) AND pending_parents>0`,再 `UPDATE tasks SET status='pending' WHERE ... pending_parents=0 AND status='blocked'`;failed/canceled 且 FailFast 时把子任务翻 canceled(M1 实现:同一事务内工作队列收敛整棵子树,强于"逐层小事务";两种形态都合法,见宪法 v1.1.0 III.4)。
 - **回收**:`UPDATE tasks SET status=CASE WHEN lease_lost+1>=? THEN 'failed' ELSE 'pending' END, lease_lost=lease_lost+1, lease_token='' WHERE status='running' AND lease_until < ? RETURNING id,status` — 一条 SQL 原子回收;随后对翻 failed 的行触发链式取消。
 - **Counts**:`SELECT type, status, COUNT(*) FROM tasks GROUP BY type, status`。
 

@@ -64,10 +64,15 @@ func (s *scheduler) track(id string, rt *runningTask) {
 	}
 }
 
-func (s *scheduler) untrack(id string) {
+// untrack 只在表里还是"自己那条"时才删:任务 Fail 落库后、untrack 执行前,
+// 同一 ID 可能已被 claimLoop 重新认领并 track 了新句柄,直接按 ID 删会把新句柄误删,
+// 让 Gate.Cancel 对新一轮执行的即时打断失效。
+func (s *scheduler) untrack(id string, rt *runningTask) {
 	s.tasksMu.Lock()
 	defer s.tasksMu.Unlock()
-	delete(s.tasks, id)
+	if s.tasks[id] == rt {
+		delete(s.tasks, id)
+	}
 }
 
 // cancelLocal 任务正在本进程跑的话,立即 cancel 它的 ctx(Gate.Cancel 的即时路径)。
@@ -236,6 +241,8 @@ func (s *scheduler) claimLoop(ctx context.Context, queue string, lim *limiter, w
 			lim.releaseSlot()
 			return
 		}
+		// 先拿令牌再 Dequeue:队列空闲期会预烧至多 1 个令牌等在 Dequeue 上,
+		// Dequeue 出错也白烧 1 个,这点偏差在 SC-001 的 ±1 容差内。
 		t, err := s.gate.broker.Dequeue(ctx, []string{queue})
 		if err != nil {
 			lim.releaseSlot()
@@ -316,9 +323,10 @@ func (s *scheduler) execute(t *Task, ttl time.Duration) {
 	if h == nil {
 		// 认领是按队列的,同队列里可能混着没注册 handler 的 Type。
 		// 没法"退回不认领"(Requeue 会立刻被自己再抢到,热循环),
-		// 裁决:按 FailSkip 落死信,LastError 写清原因,可查可手动重放。
+		// 裁决:按 FailSkip 落死信,LastError 用 ErrUnknownType 的文案做前缀,
+		// 调用方能靠文案对上这个哨兵错误;可查可手动重放。
 		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken,
-			"no handler for type "+t.Type, FailSkip, time.Time{})
+			fmt.Sprintf("%s: %s", ErrUnknownType.Error(), t.Type), FailSkip, time.Time{})
 		return
 	}
 
@@ -328,7 +336,7 @@ func (s *scheduler) execute(t *Task, ttl time.Duration) {
 	defer cancel()
 	rt := &runningTask{cancel: cancel}
 	s.track(t.ID, rt)
-	defer s.untrack(t.ID)
+	defer s.untrack(t.ID, rt)
 
 	// 心跳 goroutine:handler 退出后必须先停心跳再回执,
 	// 否则回执把任务写成终态后心跳还在飞,会白吃一堆 ErrLeaseLost。
@@ -375,9 +383,13 @@ func (s *scheduler) runHandler(ctx context.Context, h Handler, t *Task) (result 
 }
 
 // failTask handler 出错后的重试编排,错误分类三路(T017):
-//   - ErrThrottled:网关限流,按 RetryAfter 延后重排,FailThrottled(不占 Attempts);
 //   - ErrSkipRetry:明确没救,FailSkip 直接死信;
+//   - ErrThrottled:网关限流,按 RetryAfter 延后重排,FailThrottled(不占 Attempts);
 //   - 其余(含 panic):FailBusiness,退避 backoff(Attempts) 后重试。
+//
+// 必须先判 ErrSkipRetry:它带 Unwrap,如果先判 ErrThrottled,
+// ErrSkipRetry{Err: ErrThrottled{...}} 会穿透匹配到内层限流走无限重排,
+// 违背"明确不重试"的意图。
 //
 // t.Attempts 是认领时的快照(本次失败还没 +1),所以首次失败传 backoff(0)=1s 起步。
 func (s *scheduler) failTask(ctx context.Context, t *Task, herr error) {
@@ -385,12 +397,12 @@ func (s *scheduler) failTask(ctx context.Context, t *Task, herr error) {
 	var thr ErrThrottled
 	var skip ErrSkipRetry
 	switch {
-	case errors.As(herr, &thr):
-		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken, herr.Error(),
-			FailThrottled, now.Add(thr.RetryAfter))
 	case errors.As(herr, &skip):
 		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken, herr.Error(),
 			FailSkip, time.Time{})
+	case errors.As(herr, &thr):
+		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken, herr.Error(),
+			FailThrottled, now.Add(thr.RetryAfter))
 	default:
 		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken, herr.Error(),
 			FailBusiness, now.Add(s.gate.backoff(t.Attempts)))

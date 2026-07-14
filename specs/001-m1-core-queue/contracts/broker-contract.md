@@ -86,15 +86,16 @@ type Filter struct {
 ### Get / List / QueueLen / Counts
 - Get 不存在 → `ErrTaskNotFound`;返回副本,调用方改了不影响存储。
 - QueueLen = 该队列 status∈{pending,retrying} 的数量。
-- Counts = Type×Status 全矩阵,与逐个 Get 汇总一致(brokertest 验证)。
+- Counts = 出现过的 Type×Status 稀疏矩阵(只含计数非零的组合),与逐个 Get 汇总一致(brokertest 验证)。
 
 ### ReapExpired
 - 扫 status=running 且 lease_until<now 的任务:LeaseLost+1;≥LeaseLostMax → failed(LastError="lease expired N times",触发传播),否则 → pending(清令牌)。返回回收条数。
+- 例外:过期任务若带 cancel_requested=1(用户已请求取消,而此刻无 worker 持有租约)→ 直接置 canceled(FinishedAt=now,LastError="canceled",触发传播),不占 LeaseLost;取消请求不得因 worker 崩溃而丢失。该条同样计入回收条数。
 - 顺带防御性修复:"blocked 但父任务实际全部终态"的任务,按唤醒/传播规则补齐(兜底,不是正常路径)。
 
 ### 状态写入通用规则
 - 所有写入前经 canTransition 表校验,非法流转返回错误(带具体 from→to)。
-- 每次成功流转调用 opts.Notify(事务外、异步、recover 包住)。
+- 每次成功流转调用 opts.Notify(事务外、异步、recover 包住)。回调**不保证跨操作顺序**、不保证即时可见;回调 panic 不得影响触发它的主流程。
 
 ## brokertest 契约用例清单
 
@@ -116,5 +117,6 @@ type Filter struct {
 | 14 | ListFilter | 按 Type/Status/Queue/Limit 过滤正确 |
 | 15 | RequeueNoCount | Requeue 后回 pending 且三计数与 RunAt 不变 |
 | 16 | IllegalTransition | 对 completed 任务 Ack/Fail → 错误;表驱动抽查非法流转 |
+| 17 | Notify | Enqueue/Dequeue/Ack 一条链,最终能观测到 pending/running/completed 三个快照且字段正确(异步、不保证跨操作顺序);回调 panic 不影响主流程 |
 
 `brokertest.Run(t, factory func(t *testing.T) taskgate.Broker)`,内部用注入 fakeclock 控制时间(factory 返回的 broker 必须已 Init 且使用套件提供的 clock —— 具体做法:套件导出 `brokertest.Options(clk)` 供 factory 构造时传入)。

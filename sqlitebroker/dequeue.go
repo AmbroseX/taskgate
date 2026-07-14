@@ -30,6 +30,12 @@ func (b *Broker) Dequeue(ctx context.Context, queues []string) (*taskgate.Task, 
 		wake := b.wakeChan() // 先取信号再试认领:试完到挂起之间的写入不会丢信号
 		tk, next, err := b.tryClaim(ctx, queues)
 		if err != nil {
+			// ctx 取消时 database/sql 会中断正在执行的语句,错误以 sqlite 的
+			// SQLITE_INTERRUPT(错误码 9)漏出来;对调用方统一翻译回 ctx.Err(),
+			// 合同要求取消只暴露标准取消错误。
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
 			return nil, err
 		}
 		if tk != nil {
