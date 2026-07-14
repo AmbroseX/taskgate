@@ -33,11 +33,11 @@
 
 **Independent Test**: `go test ./redisbroker/... -race` 全绿;设 TASKGATE_REDIS_ADDR 后同样全绿。
 
-- [ ] T103 [US1] redisbroker 骨架:`redisbroker/broker.go`——Options{Addr,Password,DB,KeyPrefix}/New/Init/Close、键名工具、hash↔Task 编解码、Lua 加载(go:embed+redis.NewScript)、错误码映射(哨兵 vs 网络错误,research 第 9 节)、换代式同进程唤醒信号;新依赖 go-redis/v9 与 miniredis/v2
-- [ ] T104 [US1] `redisbroker/lua/enqueue.lua` + `redisbroker/enqueue.go`:查重/父校验/初始状态判定/落 hash/入 pending 或 delayed 或直接 canceled(含传播复用 finish 的收敛逻辑,可先内联)/索引/计数/types;ID 由 Go 生成注入,失败不回填
-- [ ] T105 [US1] `redisbroker/lua/claim.lua` + `redisbroker/dequeue.go`:搬到期 delayed→pending → LPOP 校验循环 → 写租约/令牌/inflight/计数 → 返回全字段;Dequeue Go 循环挂 clock/唤醒信号/ctx 三源,ctx 取消统一返回 ctx.Err();此步过 brokertest 契约 1~5(RoundTrip/IdempotentID/ClaimMutex/BlockingDequeue/DelayedTask)
-- [ ] T106 [US1] `redisbroker/lua/finish.lua`(op=ack/fail/finish_canceled/cancel/requeue 共用:令牌+canTransition 校验、整棵子树工作队列收敛、计数/索引/inflight/delayed 维护、返回流转快照)+ `redisbroker/lua/heartbeat.lua` + `redisbroker/lua/reap.lua`(含 cancel_requested→canceled、LeaseLost 封顶、blocked 防御修复)+ `redisbroker/lifecycle.go`、`redisbroker/query.go`(Get/List/QueueLen/Counts,List 走索引 set);Notify 在 Lua 返回快照后由 Go 异步发(recover 包住)
-- [ ] T107 [US1] `redisbroker/broker_test.go`:miniredis 档一行接入 brokertest,**17 条全绿**;真 Redis 档(TASKGATE_REDIS_ADDR 门控,随机 KeyPrefix 隔离+测后清理)同一 factory;补 TestUseBeforeInit(与另两后端对齐)
+- [x] T103 [US1] redisbroker 骨架:`redisbroker/broker.go`——Options{Addr,Password,DB,KeyPrefix}/New/Init/Close、键名工具、hash↔Task 编解码、Lua 加载(go:embed+redis.NewScript)、错误码映射(哨兵 vs 网络错误,research 第 9 节)、换代式同进程唤醒信号;新依赖 go-redis/v9 与 miniredis/v2
+- [x] T104 [US1] `redisbroker/lua/enqueue.lua` + `redisbroker/enqueue.go`:查重/父校验/初始状态判定/落 hash/入 pending 或 delayed 或直接 canceled(含传播复用 finish 的收敛逻辑,可先内联)/索引/计数/types;ID 由 Go 生成注入,失败不回填
+- [x] T105 [US1] `redisbroker/lua/claim.lua` + `redisbroker/dequeue.go`:搬到期 delayed→pending → LPOP 校验循环 → 写租约/令牌/inflight/计数 → 返回全字段;Dequeue Go 循环挂 clock/唤醒信号/ctx 三源,ctx 取消统一返回 ctx.Err();此步过 brokertest 契约 1~5(RoundTrip/IdempotentID/ClaimMutex/BlockingDequeue/DelayedTask)
+- [x] T106 [US1] `redisbroker/lua/finish.lua`(op=ack/fail/finish_canceled/cancel/requeue 共用:令牌+canTransition 校验、整棵子树工作队列收敛、计数/索引/inflight/delayed 维护、返回流转快照)+ `redisbroker/lua/heartbeat.lua` + `redisbroker/lua/reap.lua`(含 cancel_requested→canceled、LeaseLost 封顶、blocked 防御修复)+ `redisbroker/lifecycle.go`、`redisbroker/query.go`(Get/List/QueueLen/Counts,List 走索引 set);Notify 在 Lua 返回快照后由 Go 异步发(recover 包住)
+- [x] T107 [US1] `redisbroker/broker_test.go`:miniredis 档一行接入 brokertest,**17 条全绿**;真 Redis 档(TASKGATE_REDIS_ADDR 门控,随机 KeyPrefix 隔离+测后清理)同一 factory;补 TestUseBeforeInit(与另两后端对齐)
 
 **Checkpoint**: MVP——第三个后端契约全绿,`go test ./... -race` 全量绿。
 
