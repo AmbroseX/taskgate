@@ -17,7 +17,7 @@ import (
 )
 
 // record 一条任务的存储单元:公开的 Task 快照 + 只在后端内部用的租约/依赖字段
-//(对应 sqlite 里的 lease_until / pending_parents / cancel_requested 列)。
+// (对应 sqlite 里的 lease_until / pending_parents / cancel_requested 列)。
 type record struct {
 	task            taskgate.Task
 	pendingParents  int       // 还没到终态的父任务数,减到 0 才唤醒
@@ -247,7 +247,7 @@ func (b *Broker) nextRunAt(qset map[string]bool, now time.Time) time.Time {
 }
 
 // waitLocked 在锁内挂起等待,三种唤醒源:Cond 广播(状态变了)、clock 到点
-//(延迟/退避任务就绪)、ctx 取消。合同要求"到点任务也能唤醒阻塞的 Dequeue",
+// (延迟/退避任务就绪)、ctx 取消。合同要求"到点任务也能唤醒阻塞的 Dequeue",
 // 所以等待必须同时挂在 clock 上,不能只挂 Cond。
 func (b *Broker) waitLocked(ctx context.Context, next, now time.Time) {
 	var timerCh <-chan time.Time
@@ -313,7 +313,7 @@ func (b *Broker) Dequeue(ctx context.Context, queues []string) (*taskgate.Task, 
 }
 
 // propagateFinal 任务进终态后的依赖传播,和触发它的状态写入同处一个锁临界区
-//(等价 sqlite 的同事务),这是"不丢唤醒"的生命线。
+// (等价 sqlite 的同事务),这是"不丢唤醒"的生命线。
 // 用工作队列逐层处理:每层只碰直接子任务,子被连锁取消后再入队处理孙,不递归整棵树。
 func (b *Broker) propagateFinal(start *record, now time.Time, notifs *[]taskgate.Task) {
 	work := []*record{start}
@@ -609,7 +609,7 @@ func (b *Broker) Counts(ctx context.Context) (map[string]map[taskgate.Status]int
 
 // ReapExpired 回收过期租约:LeaseLost+1,封顶进 failed(触发传播),否则回 pending。
 // 顺带做防御性修复:blocked 但父实际全部终态的任务,按正常规则补唤醒/补取消
-//(这不是正常路径,是给"唤醒中途崩"这类事故兜底)。返回值只算租约回收条数。
+// (这不是正常路径,是给"唤醒中途崩"这类事故兜底)。返回值只算租约回收条数。
 func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
 	count, notifs, err := func() (int, []taskgate.Task, error) {
 		b.mu.Lock()

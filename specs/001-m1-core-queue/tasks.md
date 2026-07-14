@@ -50,9 +50,9 @@
 
 **Independent Test**: memory 后端 Submit→Wait 拿 Result;时间戳链完整;同 ID 二次提交 ErrTaskExists。
 
-- [ ] T010 [US1] 写 `client.go`:Gate 结构 + New(cfg 校验+Broker.Init 装配)+ Handle + Submit(Routes 路由,选项应用)+ Get/List/Stats/Overview/Wait(50ms 轮询走 clock)
-- [ ] T011 [US1] 写 `scheduler.go` 最小版:每队列 worker 池(仅并发槽,限流下一 Story)、Dequeue→handler→Ack/Fail(先只处理成功路径与 FailBusiness)、Run(ctx) 生命周期
-- [ ] T012 [US1] `integration_test.go` L3 场景:提交→执行→取结果(时间戳链)、Wait 超时(handler 睡 1s/Wait 500ms)、统计一致(Overview/Stats/List 对得上)、幂等 ID
+- [X] T010 [US1] 写 `client.go`:Gate 结构 + New(cfg 校验+Broker.Init 装配)+ Handle + Submit(Routes 路由,选项应用)+ Get/List/Stats/Overview/Wait(50ms 轮询走 clock)
+- [X] T011 [US1] 写 `scheduler.go` 最小版:每队列 worker 池(仅并发槽,限流下一 Story)、Dequeue→handler→Ack/Fail(先只处理成功路径与 FailBusiness)、Run(ctx) 生命周期
+- [X] T012 [US1] `integration_test.go` L3 场景:提交→执行→取结果(时间戳链)、Wait 超时(handler 睡 1s/Wait 500ms)、统计一致(Overview/Stats/List 对得上)、幂等 ID
 
 **Checkpoint**: MVP 可用——memory/sqlite 双后端上 Submit→completed 全链路绿。
 
@@ -64,9 +64,9 @@
 
 **Independent Test**: RPS=10 → 1s 放行 10±1;慢队列不拖快队列;纯生产者(不 Run)提交进对队列。
 
-- [ ] T013 [US2] 写 `limiter.go`:每队列信号量(带缓冲 channel)+ x/time/rate 令牌桶(RPS=0 不限速;Burst 缺省 max(1,int(RPS)));`limiter_test.go` L1:RPS 精度 10±1、Burst 生效、Workers=2 第 3 个等槽
-- [ ] T014 [US2] scheduler.go 接入 limiter:认领前"先拿并发槽再等令牌"顺序写死;handler 结束归还槽
-- [ ] T015 [US2] integration_test.go 增加:限流隔离(两队列 {W:1,RPS:1} vs {W:8})、Routes 路由(纯生产者 Gate 不 Run 提交 review→xunfei 队列,消费者 Gate 认领执行)
+- [X] T013 [US2] 写 `limiter.go`:每队列信号量(带缓冲 channel)+ x/time/rate 令牌桶(RPS=0 不限速;Burst 缺省 max(1,int(RPS)));`limiter_test.go` L1:RPS 精度 10±1、Burst 生效、Workers=2 第 3 个等槽
+- [X] T014 [US2] scheduler.go 接入 limiter:认领前"先拿并发槽再等令牌"顺序写死;handler 结束归还槽
+- [X] T015 [US2] integration_test.go 增加:限流隔离(两队列 {W:1,RPS:1} vs {W:8})、Routes 路由(纯生产者 Gate 不 Run 提交 review→xunfei 队列,消费者 Gate 认领执行)
 
 **Checkpoint**: SC-001(RPS 10±1、并发≤Workers)在 L1+L3 都有断言。
 
@@ -78,9 +78,9 @@
 
 **Independent Test**: 前 2 次失败第 3 次成功 → Attempts=3 最终 completed;ErrThrottled{1s}×3 → Attempts 不涨 RunAt 递推。
 
-- [ ] T016 [US3] 写 `backoff.go`:`min(2^n×1s,10min)±20%`(注入 rand 源)+ `backoff_test.go` L1:曲线与抖动范围断言
-- [ ] T017 [US3] scheduler.go 重试编排:handler 错误分类(errors.As ErrThrottled→FailThrottled+RetryAfter;ErrSkipRetry→FailSkip;其余→FailBusiness+退避),调 Broker.Fail
-- [ ] T018 [US3] integration_test.go 增加:重试链路(间隔递增)、ErrThrottled 链路、ErrSkipRetry、Throttled 封顶进 failed(fakeclock 或调小上限)
+- [X] T016 [US3] 写 `backoff.go`:`min(2^n×1s,10min)±20%`(注入 rand 源)+ `backoff_test.go` L1:曲线与抖动范围断言
+- [X] T017 [US3] scheduler.go 重试编排:handler 错误分类(errors.As ErrThrottled→FailThrottled+RetryAfter;ErrSkipRetry→FailSkip;其余→FailBusiness+退避),调 Broker.Fail
+- [X] T018 [US3] integration_test.go 增加:重试链路(间隔递增)、ErrThrottled 链路、ErrSkipRetry、Throttled 封顶进 failed(fakeclock 或调小上限)
 
 **Checkpoint**: P1 三个故事全绿 = 核心价值可交付。
 

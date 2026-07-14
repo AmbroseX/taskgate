@@ -1,0 +1,199 @@
+package taskgate
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// dequeueRetryWait 后端 Dequeue 出非 ctx 错误时的冷却时间,避免热循环打爆后端。
+const dequeueRetryWait = 100 * time.Millisecond
+
+// scheduler 消费侧编排:每个队列一条认领循环 + Workers 个并发槽,
+// 拿到任务后按 Type 找 handler 执行,成功 Ack、失败按错误分类 Fail。
+// M1 本阶段只搭骨架:心跳续租、reaper、Cancel 的 ctx 管理在后续 Phase 接入。
+type scheduler struct {
+	gate *Gate
+
+	mu      sync.Mutex
+	started bool
+	// running 每队列"本进程正在执行的任务数",给 Stats 用;没 Run 过的队列读到 0。
+	running map[string]*atomic.Int64
+}
+
+func newScheduler(g *Gate) *scheduler {
+	return &scheduler{gate: g, running: make(map[string]*atomic.Int64)}
+}
+
+// runningCount 读某队列当前在跑任务数(纯生产者 Gate 恒为 0)。
+func (s *scheduler) runningCount(queue string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c, ok := s.running[queue]; ok {
+		return int(c.Load())
+	}
+	return 0
+}
+
+// consumeQueues 算出要消费哪些队列:只有"注册过 handler 的 Type"对应的队列才起认领循环。
+// 多个 Type 可以路由到同一队列,所以结果按队列去重;某个 Type 路由不到可用队列直接报错。
+func (s *scheduler) consumeQueues() (map[string]QueueConfig, error) {
+	g := s.gate
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := make(map[string]QueueConfig, len(g.handlers))
+	for typ := range g.handlers {
+		name, qc, err := g.queueFor(typ)
+		if err != nil {
+			return nil, err
+		}
+		out[name] = qc
+	}
+	return out, nil
+}
+
+// run 消费主入口:每队列起一条认领循环,阻塞到 ctx 取消,
+// 然后停止认领、等所有在跑的 handler 退出后返回 nil。
+func (s *scheduler) run(ctx context.Context) error {
+	queues, err := s.consumeQueues()
+	if err != nil {
+		return err
+	}
+	if len(queues) == 0 {
+		return errors.New("taskgate: run: no handler registered, nothing to consume")
+	}
+
+	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		return errors.New("taskgate: run: already running")
+	}
+	s.started = true
+	limiters := make(map[string]*limiter, len(queues))
+	for name, qc := range queues {
+		if _, ok := s.running[name]; !ok {
+			s.running[name] = &atomic.Int64{}
+		}
+		limiters[name] = newLimiter(qc.Workers, qc.RPS, qc.Burst)
+	}
+	s.mu.Unlock()
+
+	var workerWG sync.WaitGroup // 在跑的 handler
+	var claimWG sync.WaitGroup  // 认领循环
+	for name := range queues {
+		claimWG.Add(1)
+		go func(queue string) {
+			defer claimWG.Done()
+			s.claimLoop(ctx, queue, limiters[queue], &workerWG)
+		}(name)
+	}
+	claimWG.Wait()  // ctx 取消后认领循环全部退出
+	workerWG.Wait() // 等在跑任务收尾(不打断 handler)
+
+	s.mu.Lock()
+	s.started = false
+	s.mu.Unlock()
+	return nil
+}
+
+// claimLoop 单队列认领循环。
+// 顺序写死:先占并发槽,再等 RPS 令牌,最后才 Dequeue。
+// 为什么先占槽:令牌桶按时间匀速放行,拿了令牌却没槽跑,等槽期间这个令牌等于白烧
+// (启动配额被浪费),Workers 满载时实际吞吐会低于配置的 RPS;
+// 先占槽保证"每个令牌都花在马上能跑的任务上"。
+func (s *scheduler) claimLoop(ctx context.Context, queue string, lim *limiter, workerWG *sync.WaitGroup) {
+	cnt := s.running[queue]
+	for {
+		if err := lim.acquireSlot(ctx); err != nil {
+			return // ctx 取消,停止认领
+		}
+		if err := lim.waitToken(ctx); err != nil {
+			lim.releaseSlot()
+			return
+		}
+		t, err := s.gate.broker.Dequeue(ctx, []string{queue})
+		if err != nil {
+			lim.releaseSlot()
+			if ctx.Err() != nil {
+				return
+			}
+			// 后端抖了一下:冷却后重试,不能空转打爆它。
+			_ = s.gate.clock.Sleep(ctx, dequeueRetryWait)
+			continue
+		}
+		cnt.Add(1)
+		workerWG.Add(1)
+		go func() {
+			defer func() {
+				cnt.Add(-1)
+				lim.releaseSlot()
+				workerWG.Done()
+			}()
+			s.execute(t)
+		}()
+	}
+}
+
+// execute 执行单个已认领的任务:找 handler → 跑 → Ack / Fail。
+// 回执(Ack/Fail)用 Background ctx:哪怕 Run 的 ctx 已取消,跑完的结果也必须落库。
+func (s *scheduler) execute(t *Task) {
+	ctx := context.Background()
+
+	h := s.gate.handlerFor(t.Type)
+	if h == nil {
+		// 认领是按队列的,同队列里可能混着没注册 handler 的 Type。
+		// 没法"退回不认领"(Requeue 会立刻被自己再抢到,热循环),
+		// 裁决:按 FailSkip 落死信,LastError 写清原因,可查可手动重放。
+		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken,
+			"no handler for type "+t.Type, FailSkip, time.Time{})
+		return
+	}
+
+	// handler 的 ctx 独立于 Run 的 ctx:Run 停止时在跑任务要善终,不被连坐取消。
+	// 后续 Cancel(US6)会把这个 cancel 存起来做即时取消,本阶段只留骨架。
+	taskCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result, err := s.runHandler(taskCtx, h, t)
+	if err == nil {
+		_ = s.gate.broker.Ack(ctx, t.ID, t.LeaseToken, result)
+		return
+	}
+	s.failTask(ctx, t, err)
+}
+
+// runHandler 包一层 recover:handler panic 按业务失败处理,不许砸掉调度器。
+func (s *scheduler) runHandler(ctx context.Context, h Handler, t *Task) (result []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("taskgate: handler panic: %v", r)
+		}
+	}()
+	return h(ctx, t)
+}
+
+// failTask handler 出错后的重试编排,错误分类三路(T017):
+//   - ErrThrottled:网关限流,按 RetryAfter 延后重排,FailThrottled(不占 Attempts);
+//   - ErrSkipRetry:明确没救,FailSkip 直接死信;
+//   - 其余(含 panic):FailBusiness,退避 backoff(Attempts) 后重试。
+//
+// t.Attempts 是认领时的快照(本次失败还没 +1),所以首次失败传 backoff(0)=1s 起步。
+func (s *scheduler) failTask(ctx context.Context, t *Task, herr error) {
+	now := s.gate.clock.Now()
+	var thr ErrThrottled
+	var skip ErrSkipRetry
+	switch {
+	case errors.As(herr, &thr):
+		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken, herr.Error(),
+			FailThrottled, now.Add(thr.RetryAfter))
+	case errors.As(herr, &skip):
+		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken, herr.Error(),
+			FailSkip, time.Time{})
+	default:
+		_ = s.gate.broker.Fail(ctx, t.ID, t.LeaseToken, herr.Error(),
+			FailBusiness, now.Add(s.gate.backoff(t.Attempts)))
+	}
+}
