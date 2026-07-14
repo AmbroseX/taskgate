@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ambrose/taskgate"
 	"github.com/oklog/ulid/v2"
@@ -34,7 +35,9 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		} else {
 			id = ulid.Make().String()
 		}
-		now := b.clk.Now()
+		// 时间截到毫秒:落库走 ms(unix 毫秒),回填快照若带纳秒尾巴,
+		// 就会出现"同一个后端写进去和读出来精度不一致",这里统一掐掉。
+		now := b.clk.Now().Truncate(time.Millisecond)
 
 		// 父任务必须全部已存在(依赖无环靠这条提交校验,不做环检测);
 		// 同一个父 ID 写了多遍只算一个,否则 pending_parents 会多计、永远唤不醒。
@@ -68,6 +71,11 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		stored.Status = dec.Status
 		stored.OnParentFailure = policy
 		stored.CreatedAt = now
+		// 调用方传入的时间字段(RunAt 与迁移/导入预置的 StartedAt/FinishedAt)
+		// 同样截毫秒,快照与落库读回值同精度。
+		stored.RunAt = stored.RunAt.Truncate(time.Millisecond)
+		stored.StartedAt = stored.StartedAt.Truncate(time.Millisecond)
+		stored.FinishedAt = stored.FinishedAt.Truncate(time.Millisecond)
 		if stored.RunAt.IsZero() {
 			stored.RunAt = now
 		}

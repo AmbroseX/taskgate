@@ -212,6 +212,7 @@ func equalOrdered(got, want []string) bool {
 // 契约 18 ListPagination:List 的排序与分页合同(M3,broker-contract.md 修订版)。
 // 25 个任务用 fakeclock 逐个 +1ms 入队保证 CreatedAt 全序;ID 故意按创建顺序**逆序**编号,
 // 专抓"只按 ID 排序"的错误实现——合同要求 (CreatedAt, ID) 升序,CreatedAt 优先。
+// 末段补测同毫秒并列:CreatedAt 统一毫秒精度,同一毫秒内按 ID 升序,三后端必须一致。
 func caseListPagination(t *testing.T, h *harness) {
 	const total = 25
 
@@ -273,5 +274,26 @@ func caseListPagination(t *testing.T, h *harness) {
 	// 过滤后越界:同样返回空。
 	if got := h.listOrdered(t, taskgate.Filter{Type: "llm", Limit: 5, Offset: 13}); len(got) != 0 {
 		t.Fatalf("List(Type=llm, Offset=13) 过滤后越界应返回空,实际 %v", got)
+	}
+
+	// 同毫秒并列:合同规定 CreatedAt 由 broker 统一按毫秒精度落库,同一毫秒内只能靠 ID 定序。
+	// 每条之间只把假时钟推 100µs(三条全落在同一毫秒里),ID 故意乱序("b","a","c")入队:
+	// 任何一个后端要是落了纳秒精度,这里读回的 CreatedAt 就不相等、顺序也会变成入队序而不是 ID 序。
+	for _, id := range []string{"b", "a", "c"} {
+		in := h.enqueue(t, task(id, "tie", "qtie"))
+		// 入队回填的快照必须与读回值同精度(写和读不能一个纳秒一个毫秒)。
+		if got := h.get(t, id); !in.CreatedAt.Equal(got.CreatedAt) {
+			t.Fatalf("任务 %s 入队回填的 CreatedAt=%v 与读回的 %v 不一致(写读必须同为毫秒精度)",
+				id, in.CreatedAt, got.CreatedAt)
+		}
+		h.advance(100 * time.Microsecond)
+	}
+	ta, tb, tc := h.get(t, "a"), h.get(t, "b"), h.get(t, "c")
+	if !ta.CreatedAt.Equal(tb.CreatedAt) || !tb.CreatedAt.Equal(tc.CreatedAt) {
+		t.Fatalf("同一毫秒内入队的三条 CreatedAt 应完全相等(统一毫秒精度),实际 a=%v b=%v c=%v",
+			ta.CreatedAt, tb.CreatedAt, tc.CreatedAt)
+	}
+	if got := h.listOrdered(t, taskgate.Filter{Queue: "qtie"}); !equalOrdered(got, []string{"a", "b", "c"}) {
+		t.Fatalf("CreatedAt 并列时应按 ID 升序,期望 [a b c],实际 %v", got)
 	}
 }

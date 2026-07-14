@@ -11,7 +11,7 @@ import (
 	"github.com/ambrose/taskgate/sqlitebroker"
 )
 
-// TestBrokerContract 一行接入统一契约套件:sqlite 后端必须过全部 17 条契约。
+// TestBrokerContract 一行接入统一契约套件:sqlite 后端必须过全部 18 条契约。
 // 每条用例一个独立的临时库文件,互不串数据。
 func TestBrokerContract(t *testing.T) {
 	brokertest.Run(t, func(t *testing.T, opts taskgate.BrokerOptions) taskgate.Broker {

@@ -76,9 +76,11 @@ func TestLatency(t *testing.T) {
 }
 
 // TestBusyAfterConcurrency 并发超过 1 → 后到的请求拿到 200 + busy 体,先到的正常。
-// 3 个并发:第一个占着 300ms 延迟,后两个必然在并发窗口内到达 → 恰好 2 个 busy。
+// 3 个并发:抢到位置的那个占着 2s 延迟(busy 是快速拒绝、立即返回,不吃延迟),
+// 另外两个必然落在它的处理窗口内 → 恰好 2 个 busy + 1 个 ok。
+// 窗口给足 2s 是为满负载 CI 留余量:goroutine 起跑再慢也慢不过 2s,断言本身保持"恰好"。
 func TestBusyAfterConcurrency(t *testing.T) {
-	gw := mockgw.New(mockgw.Latency(300*time.Millisecond), mockgw.BusyAfterConcurrency(1))
+	gw := mockgw.New(mockgw.Latency(2*time.Second), mockgw.BusyAfterConcurrency(1))
 	defer gw.Close()
 
 	var mu sync.Mutex
@@ -184,8 +186,9 @@ func TestFailRateDeterministic(t *testing.T) {
 
 // TestCrashAfterConcurrency 并发超过 1 → 后到的连接被直接掐断(客户端看到网络错误),
 // 先到的正常完成。3 个并发 → 恰好 2 个断连 + 1 个成功。
+// 与 TestBusyAfterConcurrency 同构:2s 窗口给满负载 CI 留余量,断言保持"恰好"。
 func TestCrashAfterConcurrency(t *testing.T) {
-	gw := mockgw.New(mockgw.Latency(300*time.Millisecond), mockgw.CrashAfterConcurrency(1))
+	gw := mockgw.New(mockgw.Latency(2*time.Second), mockgw.CrashAfterConcurrency(1))
 	defer gw.Close()
 
 	var mu sync.Mutex
@@ -217,10 +220,12 @@ func TestCrashAfterConcurrency(t *testing.T) {
 	}
 }
 
-// TestMaxConcurrencyObservation 并发观测正确性:8 个并发请求全部落在 500ms 延迟窗口内,
+// TestMaxConcurrencyObservation 并发观测正确性:8 个并发请求全部落在 2s 延迟窗口内,
 // 峰值必须恰好观测到 8(原子 CAS 不许少算),总请求数 8。
+// "恰好 8"是本用例的意义所在(峰值不许少算),不改成 ≥;用 2s 大窗口保证
+// 满负载 CI 下 8 个 goroutine 也一定全数重叠,不产生时序偶发。
 func TestMaxConcurrencyObservation(t *testing.T) {
-	gw := mockgw.New(mockgw.Latency(500 * time.Millisecond))
+	gw := mockgw.New(mockgw.Latency(2 * time.Second))
 	defer gw.Close()
 
 	const n = 8

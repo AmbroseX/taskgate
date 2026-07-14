@@ -28,7 +28,7 @@
 **Acceptance Scenarios**:
 
 1. **Given** mock LLM(并发>2 返 busy)与队列 {Workers:2},**When** 100 个任务灌入,**Then** mock 端观测最大并发 ≤2 且零 busy 触发;改成 {Workers:5} 后 busy 全部走 ErrThrottled 延后重排,最终零任务 failed。
-2. **Given** mock OCR(延迟 2s、并发>4 断连)与队列 {Workers:2},**When** 20 个任务灌入,**Then** mock 不崩、全部 completed;{Workers:4} 时断连错误走普通重试,退避后补完。
+2. **Given** mock OCR(延迟 2s、并发>4 断连)与队列 {Workers:2},**When** 20 个任务灌入,**Then** mock 不崩、全部 completed;{Workers:6} 时断连错误走普通重试,退避后补完(断连条件是并发 >4,{Workers:4} 打不破红线,必须 >4 才能真触发)。
 3. **Given** ocr→llm-extract→llm-score 三类型三队列各自限流,**When** 10 份文档并行灌入,**Then** 30 个任务全 completed,score 的 handler 能 Get 到 extract 的 Result。
 4. **Given** 流水线跑到 ocr 完成、extract 排队,**When** Cancel extract,**Then** score 连锁 canceled,ocr 保持 completed。
 5. **Given** mock LLM 返回 200 但 body 是错误事件(SSE 藏错误),**When** handler 判定后返回 ErrThrottled,**Then** 任务按重排路径最终成功——"HTTP 状态码骗人"场景被覆盖。

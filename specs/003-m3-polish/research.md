@@ -48,7 +48,8 @@
 
 ## 6. mockgw 的形态与故障开关
 
-**Decision**: `e2e/mockgw` 普通包(非 _test.go,pipeline/realgw 测试共用):`New(opts ...Option) *Gateway`,包 httptest.Server;Option:`Latency(d)`、`BusyAfterConcurrency(n)`(并发>n 返回 200+SSE 体内 busy 错误事件,复刻讯飞)、`FailRate(p float64, seed int64)`(固定种子 rand,返回 500)、`CrashAfterConcurrency(n)`(并发>n 直接 conn 断开,复刻 feedoc)、`SSEHideError()`(200 但 body 是错误事件)。Gateway 暴露 `MaxConcurrency()`、`BusyCount()`、`Requests()` 原子观测;`Close()`。
+**Decision**: `e2e/mockgw` 普通包(非 _test.go,pipeline/realgw 测试共用):`New(opts ...Option) *Gateway`,包 httptest.Server;Option:`Latency(d)`、`BusyAfterConcurrency(n)`(并发>n 返回 200+SSE 体内 busy 错误事件,复刻讯飞)、`FailRate(p float64, seed int64)`(固定种子 rand,返回 500)、`CrashAfterConcurrency(n)`(并发>n 直接 conn 断开,复刻 feedoc)、`BusyFirstN(n)`(前 n 个请求定向返回 200+busy 体,与并发无关——用例⑤"SSE 藏错误"专用,保证 busy 触发次数确定)。Gateway 暴露 `MaxConcurrency()`、`BusyCount()`、`Requests()` 原子观测;`Close()`。
+(实现校正:早期草案里的 `SSEHideError()` 与 `BusyAfterConcurrency` 的响应形态完全重合——busy 本来就藏在 200 的 SSE 体里,单独一个开关没有增量;实际落地成 `BusyFirstN(n)`,让用例⑤能确定性地拿到"先 busy 后成功"的序列。)
 
 **Rationale**: 测试方案第 4 节原文的四个开关 + 观测口;固定种子保 CI 确定(宪法 V.3);busy 藏在 200 里与真实网关行为一致,测试用例 5 直接复用。
 
@@ -60,6 +61,8 @@
 
 ## 8. L4 用例与 Gate 的接线
 
-**Decision**: 五用例全用 memory 后端(L4 测的是"限流×故障×流水线"的组合行为,后端矩阵 L2/L3 已盖);handler 是真 http.Client 打 mockgw,busy/SSE 错误判定后返回 ErrThrottled,断连/500 返回普通 error。重试预算:FailRate 档 MaxRetry 给足(如 5),断言最终零 failed。
+**Decision**: 五用例全用 memory 后端(L4 测的是"限流×故障×流水线"的组合行为,后端矩阵 L2/L3 已盖);handler 是真 http.Client 打 mockgw,busy/SSE 错误判定后返回 ErrThrottled,断连/500 返回普通 error。重试预算:故障档 MaxRetry 给足(如 5),断言最终零 failed。
+
+**裁决(FailRate 的消费方)**: `FailRate` 开关由 mockgw 自测覆盖(同种子序列逐位一致、失败数非全零非全一),L4 五用例不消费它——测试方案第 4 节曾设想把 FailRate(0.1) 并入用例①,但随机 500 会让"BusyCount 与 Throttled 逐一对账"的断言非确定,与宪法 V.3(CI 确定性)冲突;500 触发的"普通错误→退避重试→补完"路径已由用例②的断连档完整覆盖,再加一档只是换个错误形态,增量为零。故只保留开关能力,供后续需要时(或 realgw 前的手工演练)取用。
 
 **Rationale**: 测试方案第 4 节的意图是端到端行为验证,不是后端矩阵;单后端跑五用例控制 CI 时长。

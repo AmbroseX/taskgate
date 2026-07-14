@@ -52,7 +52,7 @@
 **Independent Test**: `go test ./e2e/... -race` 全绿。
 
 - [x] T207 [US1] 写 e2e/mockgw/mockgw.go:New(opts)/URL/Close/MaxConcurrency/BusyCount/Requests + Latency/BusyAfterConcurrency(200+SSE busy 事件)/FailRate(固定种子)/CrashAfterConcurrency(断连) 四开关,并发观测原子;响应体约定照 data-model 第 5 节;附 mockgw_test.go 最小自测(开关行为+并发观测正确性)
-- [x] T208 [US1] 写 e2e/pipeline_test.go 五用例(memory 后端):①限流挡 busy({W:2} MaxConcurrency≤2 且 BusyCount=0;{W:5} busy 走 ErrThrottled 零 failed)②OCR 灌库({W:2} 不崩全完;{W:4} 断连走普通重试补完)③三队列流水线 30/30 且 score 读到 extract 的 Result ④中途取消(ocr 完成、Cancel extract → score 连锁 canceled、ocr 保持 completed)⑤SSE 藏错误(200 体内错误事件 → handler 判定 ErrThrottled → 重排后成功)
+- [x] T208 [US1] 写 e2e/pipeline_test.go 五用例(memory 后端):①限流挡 busy({W:2} MaxConcurrency≤2 且 BusyCount=0;{W:5} busy 走 ErrThrottled 零 failed)②OCR 灌库({W:2} 不崩全完;{W:6} 断连走普通重试补完——断连条件并发 >4,{W:4} 打不破红线)③三队列流水线 30/30 且 score 读到 extract 的 Result ④中途取消(ocr 完成、Cancel extract → score 连锁 canceled、ocr 保持 completed)⑤SSE 藏错误(200 体内错误事件 → handler 判定 ErrThrottled → 重排后成功)
 
 **Checkpoint**: L4 全绿,M3 核心交付达成(测试方案第 9 节"M3 试点前=L4 全绿")。
 

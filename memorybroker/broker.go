@@ -66,6 +66,13 @@ func (b *Broker) Init(opts taskgate.BrokerOptions) error {
 	return nil
 }
 
+// now 当前时刻截到毫秒。合同规定时间戳由 broker 统一按毫秒精度落库
+// (sqlite/redis 存 unix 毫秒天然截断),memory 后端在所有写入点跟着截,
+// 否则同一毫秒内入队的任务排序会跟另外两个后端不一致。
+func (b *Broker) now() time.Time {
+	return b.clk.Now().Truncate(time.Millisecond)
+}
+
 // ttlFor 队列的租约时长:按队列配置,没配走缺省。
 func (b *Broker) ttlFor(queue string) time.Duration {
 	if d, ok := b.opts.LeaseTTL[queue]; ok && d > 0 {
@@ -165,7 +172,7 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		} else {
 			id = ulid.Make().String()
 		}
-		now := b.clk.Now()
+		now := b.now()
 
 		// 父任务必须全部已存在(依赖无环靠这条提交校验,不做环检测)。
 		parents := make([]taskgate.ParentState, 0, len(t.DependsOn))
@@ -187,6 +194,11 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		rec.task.Status = dec.Status
 		rec.task.OnParentFailure = policy
 		rec.task.CreatedAt = now
+		// 调用方传入的时间字段(RunAt 与迁移/导入场景预置的 StartedAt/FinishedAt)
+		// 同样截毫秒:sqlite/redis 落库即毫秒,memory 必须同精度,读回值三后端一致。
+		rec.task.RunAt = rec.task.RunAt.Truncate(time.Millisecond)
+		rec.task.StartedAt = rec.task.StartedAt.Truncate(time.Millisecond)
+		rec.task.FinishedAt = rec.task.FinishedAt.Truncate(time.Millisecond)
 		if rec.task.RunAt.IsZero() {
 			rec.task.RunAt = now
 		}
@@ -297,7 +309,7 @@ func (b *Broker) Dequeue(ctx context.Context, queues []string) (*taskgate.Task, 
 			b.mu.Unlock()
 			return nil, err
 		}
-		now := b.clk.Now()
+		now := b.now()
 		if rec := b.pickReady(qset, now); rec != nil {
 			if err := b.setStatus(rec, taskgate.StatusRunning); err != nil {
 				b.mu.Unlock()
@@ -371,7 +383,7 @@ func (b *Broker) Ack(ctx context.Context, id, leaseToken string, result []byte) 
 		if err := b.setStatus(rec, taskgate.StatusCompleted); err != nil {
 			return nil, err
 		}
-		now := b.clk.Now()
+		now := b.now()
 		if result != nil {
 			rec.task.Result = append([]byte(nil), result...)
 		}
@@ -399,7 +411,7 @@ func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind t
 		if err != nil {
 			return nil, err
 		}
-		now := b.clk.Now()
+		now := b.now()
 
 		toFailed := false
 		rec.task.LastError = errMsg
@@ -441,7 +453,7 @@ func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind t
 		if retryAt.IsZero() {
 			retryAt = now
 		}
-		rec.task.RunAt = retryAt
+		rec.task.RunAt = retryAt.Truncate(time.Millisecond) // 与 sqlite/redis 的毫秒落库同精度
 		clearLease(rec)
 		b.cond.Broadcast() // 让等待中的 Dequeue 重算下一个到点时刻
 		return []taskgate.Task{*cloneTask(&rec.task)}, nil
@@ -473,7 +485,7 @@ func (b *Broker) Cancel(ctx context.Context, id string) error {
 		if err := b.setStatus(rec, taskgate.StatusCanceled); err != nil {
 			return nil, err
 		}
-		now := b.clk.Now()
+		now := b.now()
 		rec.task.LastError = "canceled"
 		rec.task.FinishedAt = now
 		clearLease(rec)
@@ -501,7 +513,7 @@ func (b *Broker) FinishCanceled(ctx context.Context, id, leaseToken string) erro
 		if err := b.setStatus(rec, taskgate.StatusCanceled); err != nil {
 			return nil, err
 		}
-		now := b.clk.Now()
+		now := b.now()
 		rec.task.LastError = "canceled"
 		rec.task.FinishedAt = now
 		clearLease(rec)
@@ -552,7 +564,7 @@ func (b *Broker) Heartbeat(ctx context.Context, id, leaseToken string) error {
 	if err != nil {
 		return err
 	}
-	rec.leaseUntil = b.clk.Now().Add(b.ttlFor(rec.task.Queue))
+	rec.leaseUntil = b.now().Add(b.ttlFor(rec.task.Queue))
 	if rec.cancelRequested {
 		return fmt.Errorf("%w: task %s", taskgate.ErrTaskCanceled, id)
 	}
@@ -656,7 +668,7 @@ func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
 		if err := b.requireInit(); err != nil {
 			return 0, nil, err
 		}
-		now := b.clk.Now()
+		now := b.now()
 		var notifs []taskgate.Task
 		count := 0
 

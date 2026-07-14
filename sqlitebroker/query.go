@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 
 	"github.com/ambrose/taskgate"
 )
@@ -119,7 +120,7 @@ func (b *Broker) ReapExpired(ctx context.Context) (int, error) {
 	var notifs []taskgate.Task
 	count := 0
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
-		now := b.clk.Now()
+		now := b.clk.Now().Truncate(time.Millisecond) // 截毫秒:快照与毫秒落库同精度
 		nowMS := now.UnixMilli()
 
 		// 第零步:带取消标记的过期任务。用户已请求取消,而此刻租约过期、

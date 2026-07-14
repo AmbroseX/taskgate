@@ -14,7 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// TestBrokerContract 一行接入统一契约套件:redis 后端必须过全部 17 条契约。
+// TestBrokerContract 一行接入统一契约套件:redis 后端必须过全部 18 条契约。
 // 每条用例一个独立的 miniredis 实例,互不串数据;时间全靠套件注入的 fakeclock
 // (脚本内时间由 ARGV 传入,miniredis 自身的时钟不参与)。
 func TestBrokerContract(t *testing.T) {
@@ -32,7 +32,7 @@ func TestBrokerContract(t *testing.T) {
 }
 
 // TestBrokerContractRealRedis 真 Redis 档:设 TASKGATE_REDIS_ADDR 才跑
-// (如 TASKGATE_REDIS_ADDR=127.0.0.1:6379),同一套 17 条契约。
+// (如 TASKGATE_REDIS_ADDR=127.0.0.1:6379),同一套 18 条契约。
 // 每条用例用随机 KeyPrefix 隔离,测后 SCAN+DEL 清理,不污染共用实例。
 func TestBrokerContractRealRedis(t *testing.T) {
 	addr := os.Getenv("TASKGATE_REDIS_ADDR")

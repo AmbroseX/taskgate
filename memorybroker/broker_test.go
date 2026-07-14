@@ -10,7 +10,7 @@ import (
 	"github.com/ambrose/taskgate/memorybroker"
 )
 
-// TestBrokerContract 一行接入统一契约套件:memory 后端必须过全部 17 条契约。
+// TestBrokerContract 一行接入统一契约套件:memory 后端必须过全部 18 条契约。
 func TestBrokerContract(t *testing.T) {
 	brokertest.Run(t, func(t *testing.T, opts taskgate.BrokerOptions) taskgate.Broker {
 		b := memorybroker.New()

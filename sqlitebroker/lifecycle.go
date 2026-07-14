@@ -27,7 +27,7 @@ func (b *Broker) Ack(ctx context.Context, id, leaseToken string, result []byte) 
 		if !taskgate.CanTransition(r.task.Status, taskgate.StatusCompleted) {
 			return illegalTransition(r.task.Status, taskgate.StatusCompleted, id)
 		}
-		now := b.clk.Now()
+		now := b.clk.Now().Truncate(time.Millisecond) // 截毫秒:快照与毫秒落库同精度
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET
 				status = 'completed', result = ?, finished_at = ?,
 				lease_token = '', lease_until = 0, cancel_requested = 0
@@ -72,7 +72,7 @@ func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind t
 		if err := checkLeaseRec(r, leaseToken); err != nil {
 			return err
 		}
-		now := b.clk.Now()
+		now := b.clk.Now().Truncate(time.Millisecond) // 截毫秒:快照与毫秒落库同精度
 
 		toFailed := false
 		r.task.LastError = errMsg
@@ -117,6 +117,7 @@ func (b *Broker) Fail(ctx context.Context, id, leaseToken, errMsg string, kind t
 		if retryAt.IsZero() {
 			retryAt = now
 		}
+		retryAt = retryAt.Truncate(time.Millisecond) // 快照与毫秒落库同精度
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET
 				status = 'retrying', last_error = ?, attempts = ?, throttled = ?, run_at = ?,
 				lease_token = '', lease_until = 0
@@ -162,7 +163,7 @@ func (b *Broker) Cancel(ctx context.Context, id string) error {
 		if !taskgate.CanTransition(r.task.Status, taskgate.StatusCanceled) {
 			return illegalTransition(r.task.Status, taskgate.StatusCanceled, id)
 		}
-		now := b.clk.Now()
+		now := b.clk.Now().Truncate(time.Millisecond) // 截毫秒:快照与毫秒落库同精度
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET
 				status = 'canceled', last_error = 'canceled', finished_at = ?,
 				lease_token = '', lease_until = 0
@@ -202,7 +203,7 @@ func (b *Broker) FinishCanceled(ctx context.Context, id, leaseToken string) erro
 		if !taskgate.CanTransition(r.task.Status, taskgate.StatusCanceled) {
 			return illegalTransition(r.task.Status, taskgate.StatusCanceled, id)
 		}
-		now := b.clk.Now()
+		now := b.clk.Now().Truncate(time.Millisecond) // 截毫秒:快照与毫秒落库同精度
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET
 				status = 'canceled', last_error = 'canceled', finished_at = ?,
 				lease_token = '', lease_until = 0, cancel_requested = 0

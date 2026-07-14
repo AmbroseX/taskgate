@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/ambrose/taskgate"
 	"github.com/oklog/ulid/v2"
@@ -34,8 +35,10 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	} else if err := validateID(id); err != nil {
 		return err
 	}
-	now := b.clk.Now()
-	runAt := t.RunAt
+	// 时间一律先截到毫秒:脚本按 UnixMilli 落库,回填快照若带纳秒尾巴,
+	// 就会出现"同一个后端写进去和读出来精度不一致",这里统一掐掉。
+	now := b.clk.Now().Truncate(time.Millisecond)
+	runAt := t.RunAt.Truncate(time.Millisecond)
 	if runAt.IsZero() {
 		runAt = now // RunAt 零值取入队时刻
 	}
@@ -98,6 +101,9 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	stored.OnParentFailure = policy
 	stored.CreatedAt = now
 	stored.RunAt = runAt
+	// 预置的 StartedAt/FinishedAt 落库时走 ms(),快照也截到同一精度,写读一致。
+	stored.StartedAt = stored.StartedAt.Truncate(time.Millisecond)
+	stored.FinishedAt = stored.FinishedAt.Truncate(time.Millisecond)
 	stored.LeaseToken = "" // 入队不可能自带租约
 	if stored.Status == taskgate.StatusCanceled {
 		// 提交时父已失败/取消且 FailFast:直接以 canceled 落库。
