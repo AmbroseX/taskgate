@@ -55,6 +55,10 @@ type Broker interface {
 // 上层依然不 import 任何后端包,不违反宪法 II.2"上层不特判后端":
 // 新后端想提供分布式限流,实现本接口即可;memory/sqlite 不实现,
 // scheduler 自动退回进程内限流(localLimiter),行为与 M1 完全一致。
+//
+// 实现约束:QueueLimiter 的构造必须廉价、不得持有需要显式释放的资源——
+// 本接口没有 Close,某个队列构造失败时之前已建成的限流器不会被回收,
+// 构造期占了资源就是泄漏(redisbroker 的实现只是复用 Broker 连接拼参数,零资源)。
 type LimiterProvider interface {
 	// QueueLimiter 按队列配置构造该队列的限流器;出错时 Gate.Run 直接返回该错误。
 	QueueLimiter(queue string, qc QueueConfig) (QueueLimiter, error)

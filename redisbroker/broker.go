@@ -61,6 +61,8 @@ type Options struct {
 	Password string // 密码,空 = 不认证
 	DB       int    // 库号
 	// KeyPrefix 所有键的前缀,默认 "tg:";多应用共用一个 Redis 时用它隔离。
+	// 例外:RPS 限速状态键不在本前缀命名空间内——redis_rate 自己会再加 "rate:"
+	// 前缀,最终键形如 "rate:<KeyPrefix><queue>";按前缀批量清理/统计时别漏了它。
 	KeyPrefix string
 }
 
@@ -74,6 +76,9 @@ type Broker struct {
 	clk    taskgate.Clock
 	inited bool
 	closed bool
+
+	limMu    sync.Mutex      // 保护 limiters 记账(与 mu 分开,互不嵌套)
+	limiters []*queueLimiter // QueueLimiter 发出去的限流器,Close 时统一停续期
 }
 
 // 编译期断言:*Broker 必须实现完整的 Broker 接口。
@@ -121,7 +126,11 @@ func (b *Broker) Init(opts taskgate.BrokerOptions) error {
 	return nil
 }
 
-// Close 关连接:标记 closed 并广播,让阻塞中的 Dequeue 尽快退出,再关客户端。
+// Close 关连接:标记 closed 并广播,让阻塞中的 Dequeue 尽快退出,再关客户端,
+// 最后统一停掉所有已发限流器仍在续期的槽(不然续期 goroutine 会一直空转泄漏)。
+// 顺序讲究:先关客户端再收尾限流器——归还路径的 ZREM 在关掉的连接上失败被容忍,
+// Redis 里的槽按 TTL 自然过期回收,语义与"进程崩溃"一致(槽不许被 Close 抢先删掉,
+// 别的进程要等 TTL 才能占,这正是崩溃自愈的既定口径)。
 func (b *Broker) Close() error {
 	b.mu.Lock()
 	if b.closed {
@@ -132,7 +141,16 @@ func (b *Broker) Close() error {
 	close(b.wakeCh)
 	b.wakeCh = make(chan struct{})
 	b.mu.Unlock()
-	return b.rdb.Close()
+	err := b.rdb.Close()
+
+	b.limMu.Lock()
+	lims := b.limiters
+	b.limiters = nil
+	b.limMu.Unlock()
+	for _, l := range lims {
+		l.shutdown()
+	}
+	return err
 }
 
 // requireInit 没 Init 就用是接线错误,直接报错而不是悄悄用坏参数跑。
@@ -239,6 +257,14 @@ func mapLuaErr(err error) error {
 }
 
 // ---- Task ↔ hash 编解码 ----
+
+// ms 时间转 unix 毫秒;零值时间统一存 0(与 sqlite 同约定,fromMS 的反向)。
+func ms(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
+}
 
 // fromMS 毫秒转回 time.Time;0 还原成零值时间(零值时间落库统一存 0,与 sqlite 同约定)。
 func fromMS(v int64) time.Time {

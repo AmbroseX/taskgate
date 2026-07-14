@@ -259,7 +259,7 @@ func (s *scheduler) claimLoop(ctx context.Context, queue string, lim QueueLimite
 			return
 		}
 		// 先拿令牌再 Dequeue:队列空闲期会预烧至多 1 个令牌等在 Dequeue 上,
-		// Dequeue 出错也白烧 1 个,这点偏差在 SC-001 的 ±1 容差内。
+		// Dequeue 出错也白烧 1 个,这点偏差在 M1 spec SC-001 的 ±1 容差内。
 		t, err := s.gate.broker.Dequeue(ctx, []string{queue})
 		if err != nil {
 			lim.ReleaseSlot()

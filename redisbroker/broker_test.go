@@ -54,29 +54,63 @@ func TestBrokerContractRealRedis(t *testing.T) {
 }
 
 // cleanupPrefix 删掉本用例前缀下的所有键(broker 自身可能已 Close,单开一个连接)。
+// 除了 prefix* 还要扫 "rate:"+prefix+"*":redis_rate 的 GCRA 键自带 "rate:" 前缀
+// (形如 rate:<prefix><queue>),不在 KeyPrefix 命名空间内,漏扫会残留在共用实例上。
 func cleanupPrefix(t *testing.T, addr, prefix string) {
 	t.Helper()
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
 	defer rdb.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	var cursor uint64
-	for {
-		keys, next, err := rdb.Scan(ctx, cursor, prefix+"*", 500).Result()
-		if err != nil {
-			t.Logf("清理前缀 %s 失败(不影响断言): %v", prefix, err)
-			return
-		}
-		if len(keys) > 0 {
-			if err := rdb.Del(ctx, keys...).Err(); err != nil {
-				t.Logf("清理前缀 %s 失败(不影响断言): %v", prefix, err)
-				return
+	for _, pattern := range []string{prefix + "*", "rate:" + prefix + "*"} {
+		var cursor uint64
+		for {
+			keys, next, err := rdb.Scan(ctx, cursor, pattern, 500).Result()
+			if err != nil {
+				t.Logf("清理 %s 失败(不影响断言): %v", pattern, err)
+				break
+			}
+			if len(keys) > 0 {
+				if err := rdb.Del(ctx, keys...).Err(); err != nil {
+					t.Logf("清理 %s 失败(不影响断言): %v", pattern, err)
+					break
+				}
+			}
+			cursor = next
+			if cursor == 0 {
+				break
 			}
 		}
-		cursor = next
-		if cursor == 0 {
-			return
+	}
+}
+
+// TestEnqueueRejectsControlCharID 自定义 ID 含 ASCII 控制字符必须在 Go 侧拒收:
+// \x1F 是 hash 里 parents 字段的拼接分隔符,混进 ID 会破坏 reap.lua 的解析;
+// 其余控制字符一并挡掉(0x00~0x1F 与 0x7F)。合法 ID 不受影响。
+func TestEnqueueRejectsControlCharID(t *testing.T) {
+	mr := miniredis.RunT(t)
+	b, err := redisbroker.New(redisbroker.Options{Addr: mr.Addr()})
+	if err != nil {
+		t.Fatalf("New 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Init(taskgate.BrokerOptions{}); err != nil {
+		t.Fatalf("Init 失败: %v", err)
+	}
+	ctx := context.Background()
+	for _, id := range []string{"a\x1fb", "a\x00b", "\tab", "a\x7f"} {
+		err := b.Enqueue(ctx, &taskgate.Task{ID: id, Type: "x", Queue: "q"})
+		if err == nil {
+			t.Fatalf("含控制字符的 ID %q 应被拒收,实际入队成功", id)
 		}
+		if _, gerr := b.Get(ctx, id); gerr == nil {
+			t.Fatalf("被拒收的 ID %q 不应落库", id)
+		}
+	}
+	// 合法的自定义 ID(可见 ASCII、带空格/中文都行)照常入队。
+	ok := &taskgate.Task{ID: "自定义 id-1", Type: "x", Queue: "q"}
+	if err := b.Enqueue(ctx, ok); err != nil {
+		t.Fatalf("合法自定义 ID 不应被拒: %v", err)
 	}
 }
 

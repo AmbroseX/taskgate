@@ -69,6 +69,8 @@ scheduler 装配:`if lp, ok := broker.(LimiterProvider); ok { 用它 } else { ne
 
 **Alternatives considered**: Redis 官方 Redlock/SETNX 单锁:是互斥锁不是计数信号量,排除;INCR/DECR 计数:崩溃不自愈,排除。
 
+**Amendment(实现修订)**:续期最终实现为**无条件 ZADD(upsert)**,不是上文的"ZADD XX 更新 score"。区别在成员已丢失时的行为:XX 只更新已存在的成员,续期被断连/停顿拖过 TTL、槽已被 sem_acquire 清掉后,XX 等于放弃续期——别的进程会立刻占走空位,而本进程的任务还在跑,全局实际并发从此**永久超限**;无条件 upsert 则是"静默重占",最多短暂超限一拍,靠对方槽的自然过期收敛。两害取轻选后者(与 redisbroker/limiter.go renewLoop 的注释一致)。
+
 ## 7. RPS 分布式令牌桶
 
 **Decision**: `github.com/go-redis/redis_rate/v10`(GCRA)。`WaitToken` = AllowN(1) 循环:被拒时按返回的 RetryAfter 等待(挂注入 clock)再试。Burst 映射到 redis_rate 的 Burst 参数;RPS=0 仍是"不限速"直通。

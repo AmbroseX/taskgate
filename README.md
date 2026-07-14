@@ -116,6 +116,7 @@ redis 后端额外实现了 `LimiterProvider` 能力接口,同一队列的 `{Wor
 | `tg:stats` | hash | Type×Status 计数,字段 `{type}:{status}` | `HGETALL tg:stats` |
 | `tg:types` | set | 出现过的 Type | `SMEMBERS tg:types` |
 | `tg:sem:{queue}` | zset | 分布式并发槽(限流器私有) | `ZCARD tg:sem:scoring` |
+| `rate:tg:{queue}` | string | RPS 限速状态(redis_rate 的 GCRA 内部,限流器私有)。注意 `rate:` 前缀由 redis_rate 加在最外层,该键**不在** `KeyPrefix` 命名空间内(实际键名 = `rate:` + KeyPrefix + 队列名),按前缀批量清理时别漏 | `GET rate:tg:scoring` |
 
 `Counts`/`Overview` 就是读 `tg:stats`(每次流转时 Lua 顺手 HINCRBY 维护),`QueueLen` 就是 `LLEN + ZCARD`,都是计数器/长度读取,不扫全库。
 

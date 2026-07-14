@@ -97,7 +97,10 @@ func benchEnqueueParallel(b *testing.B, br taskgate.Broker) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			if _, err := g.Submit(context.Background(), benchQueue, payload); err != nil {
-				b.Fatalf("Submit 失败: %v", err)
+				// RunParallel 体在子 goroutine 里跑,testing 规定 Fatal 只能在主
+				// goroutine 调,这里用 Error+return 标失败并结束本 goroutine。
+				b.Errorf("Submit 失败: %v", err)
+				return
 			}
 		}
 	})

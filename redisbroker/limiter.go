@@ -45,7 +45,7 @@ func (b *Broker) QueueLimiter(queue string, qc taskgate.QueueConfig) (taskgate.Q
 	if err := b.requireInit(); err != nil {
 		return nil, err
 	}
-	return &queueLimiter{
+	l := &queueLimiter{
 		rdb:     b.rdb,
 		clk:     b.clk,
 		prefix:  b.prefix,
@@ -57,7 +57,12 @@ func (b *Broker) QueueLimiter(queue string, qc taskgate.QueueConfig) (taskgate.Q
 		// redis_rate 自己会再加 "rate:" 前缀,最终键形如 "rate:tg:{q}"。
 		rateKey: b.prefix + queue,
 		limit:   rateLimit(qc.RPS, qc.Burst),
-	}, nil
+	}
+	// 记账:Broker.Close 时统一停掉本限流器还在续期的槽(零 goroutine 泄漏)。
+	b.limMu.Lock()
+	b.limiters = append(b.limiters, l)
+	b.limMu.Unlock()
+	return l, nil
 }
 
 // queueLimiter 单个队列的分布式限流器。taskgate.QueueLimiter 的 Redis 实现。
@@ -137,6 +142,21 @@ func (l *queueLimiter) ReleaseSlot() {
 	defer cancel()
 	// ZREM 失败(断连/已 Close)也没事:槽不续期了,到 TTL 自然过期回收。
 	_ = l.rdb.ZRem(ctx, l.semKey, s.member).Err()
+}
+
+// shutdown 归还本实例仍持有的全部槽,Broker.Close 专用:
+// 逐个复用 ReleaseSlot 的 close+wait 路径(同步等续期 goroutine 退出);
+// 连接通常已关,ZREM 失败被容忍,槽靠 TTL 自然过期回收(与崩溃自愈同口径)。
+func (l *queueLimiter) shutdown() {
+	for {
+		l.mu.Lock()
+		n := len(l.held)
+		l.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		l.ReleaseSlot()
+	}
 }
 
 // WaitToken 等一个全局 RPS 令牌;不限速时立即放行;ctx 取消返回其错误。

@@ -11,6 +11,8 @@
 local key = P .. 'sem:' .. ARGV[2]
 local now = tonumber(ARGV[4])
 
+-- 清过期用 score≤now 闭区间(槽压线即清),与 reap.lua 租约的 '(' 开区间
+-- (压线不算过期)口径不同,是有意的:槽宁可早一拍让位,租约宁可多留一拍。
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
 if redis.call('ZCARD', key) < tonumber(ARGV[3]) then
   redis.call('ZADD', key, now + tonumber(ARGV[5]), ARGV[6])

@@ -12,6 +12,7 @@ local snaps = {}
 local count = 0
 
 -- 第一步:扫 inflight 里 lease_until < now 的到期项('(' 开区间:压线不算过期)。
+-- 与 sem_acquire.lua 清槽的闭区间(压线即清)口径不同,是有意的口径差异。
 -- hash 是权威:zset 里的残留(状态早已不是 running)只做清理,不计入回收。
 local expired = redis.call('ZRANGEBYSCORE', kInflight, '-inf', '(' .. nowStr)
 for _, id in ipairs(expired) do

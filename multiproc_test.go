@@ -129,6 +129,14 @@ func TestMultiprocHelper(t *testing.T) {
 			}
 			time.Sleep(150 * time.Millisecond) // 停留一拍,让两个进程的执行窗口真实重叠
 			if derr := rdb.Decr(ctx, mpConcKey).Err(); derr != nil {
+				// 补偿:Incr 已成功,Decr 没落地就带错返回会让计数悬空 +1——
+				// 任务重试再 Incr 一遍,计数永久虚高,制造假的"并发超限"。
+				// 换不受 handler ctx 影响的短超时 ctx 再补一次;极小概率首次 Decr
+				// 其实已在服务端生效(响应丢失),补一次会多减 1,只会让并发计数
+				// 偏低(断言更难误报超限),不会制造假阳性,两害取轻。
+				bctx, bcancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = rdb.Decr(bctx, mpConcKey).Err()
+				bcancel()
 				return nil, derr
 			}
 		}
@@ -176,10 +184,29 @@ func shutdownWhenCounted(g *taskgate.Gate, b taskgate.Broker, total int, status 
 	}()
 }
 
+// syncBuffer 带锁的输出缓冲:子进程的 Stdout/Stderr 由 exec 包在后台 goroutine
+// 里写入,父测试失败时(Cleanup 阶段)可能与之并发读,必须加锁防数据竞争。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // workerProc 一个子进程 worker 的句柄:输出攒在缓冲区,失败时才打出来。
 type workerProc struct {
 	cmd *exec.Cmd
-	out bytes.Buffer
+	out syncBuffer
 }
 
 // spawnWorker exec 自身测试二进制拉起子进程 worker(跑 TestMultiprocHelper),
@@ -198,6 +225,13 @@ func spawnHelper(t *testing.T, helper, addr string, ttl time.Duration, extra ...
 		t.Fatalf("拿不到测试二进制路径: %v", err)
 	}
 	w := &workerProc{}
+	// 用例失败时(比如 waitFor 超时 Fatalf)把子进程输出补打出来,不然日志就丢了;
+	// 先注册,Cleanup 按 LIFO 执行,轮到它时下面注册的 Kill+Wait 已完成,输出完整。
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("子进程(%s)输出:\n%s", helper, w.out.String())
+		}
+	})
 	w.cmd = exec.Command(exe, "-test.run=^"+helper+"$", "-test.timeout=2m")
 	w.cmd.Env = append(os.Environ(),
 		"TASKGATE_MP_HELPER=1",

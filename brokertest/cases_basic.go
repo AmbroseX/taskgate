@@ -64,6 +64,26 @@ func caseRoundTrip(t *testing.T, h *harness) {
 		t.Fatalf("RunAt 零值应取入队时刻 %v,实际 %v", h.now(), got2.RunAt)
 	}
 
+	// 调用方预置的 LastError/StartedAt/FinishedAt(迁移/导入场景)必须原样落库、往返一致,
+	// 后端不得悄悄清零(canceled 判定覆盖 LastError/FinishedAt 是唯一例外,不在本用例)。
+	preStarted := h.now().Add(-2 * time.Hour)
+	preFinished := h.now().Add(-time.Hour)
+	pre := task("t3", "llm", "q-llm")
+	pre.LastError = "imported: last failure"
+	pre.StartedAt = preStarted
+	pre.FinishedAt = preFinished
+	h.enqueue(t, pre)
+	got3 := h.get(t, "t3")
+	if got3.LastError != "imported: last failure" {
+		t.Fatalf("往返后预置 LastError 不一致: %q", got3.LastError)
+	}
+	if !got3.StartedAt.Equal(preStarted) {
+		t.Fatalf("往返后预置 StartedAt 不一致: %v != %v", got3.StartedAt, preStarted)
+	}
+	if !got3.FinishedAt.Equal(preFinished) {
+		t.Fatalf("往返后预置 FinishedAt 不一致: %v != %v", got3.FinishedAt, preFinished)
+	}
+
 	// Get 必须返回副本:调用方改返回值不能影响存储。
 	got.Payload[0] = 'X'
 	got.DependsOn[0] = "hacked"

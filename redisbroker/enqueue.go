@@ -9,6 +9,18 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
+// validateID 校验自定义任务 ID:ASCII 控制字符(< 0x20 或 0x7F)会破坏 hash 里
+// parents 字段的 \31(单元分隔符)拼接解析(reap.lua 的防御修复按 \31 切分),直接拒收。
+// 只挡控制字符,不做其它字符集限制;Go 生成的 ulid 天然安全,不走这里。
+func validateID(id string) error {
+	for i := 0; i < len(id); i++ {
+		if c := id[i]; c < 0x20 || c == 0x7F {
+			return fmt.Errorf("redisbroker: invalid task ID %q: ASCII control characters are not allowed", id)
+		}
+	}
+	return nil
+}
+
 // Enqueue 入队。查重、父校验、初始状态判定、落库全部在 enqueue.lua 一段脚本内原子完成;
 // ID 由 Go 生成注入(脚本内禁 math.random),生成的 ID 与判定结果只在成功后回填 *t——
 // 报错路径不能让调用方拿到一个根本不存在的孤儿 ID(合同 Enqueue 条款)。
@@ -19,6 +31,8 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	id := t.ID
 	if id == "" {
 		id = ulid.Make().String()
+	} else if err := validateID(id); err != nil {
+		return err
 	}
 	now := b.clk.Now()
 	runAt := t.RunAt
@@ -52,10 +66,13 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		depsJSON = string(raw)
 	}
 
-	args := make([]any, 0, 15+len(uniq))
+	// 调用方预置的 LastError/StartedAt/FinishedAt 也原样传给脚本落库
+	// (迁移/导入场景会预置这些字段,与 memory/sqlite 的"原样落库"对齐)。
+	args := make([]any, 0, 18+len(uniq))
 	args = append(args, b.prefix, id, t.Type, t.Queue, string(t.Payload), string(t.Result),
 		t.MaxRetry, t.Attempts, t.LeaseLost, t.Throttled,
-		runAt.UnixMilli(), depsJSON, string(policy), now.UnixMilli(), len(uniq))
+		runAt.UnixMilli(), depsJSON, string(policy), now.UnixMilli(),
+		t.LastError, ms(t.StartedAt), ms(t.FinishedAt), len(uniq))
 	for _, pid := range uniq {
 		args = append(args, pid)
 	}
