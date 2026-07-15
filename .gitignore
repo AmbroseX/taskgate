@@ -1,0 +1,30 @@
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# IDEs 和 编辑器
+.claude/
+.playwright-mcp/
+
+
+# 开发环境
+**/.local/
+**/.venv/
+**/.conda/
