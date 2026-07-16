@@ -8,6 +8,8 @@ package sqlitebroker
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -215,4 +217,77 @@ func claimAck(t *testing.T, b *Broker, queue, id string) {
 	if err := b.Ack(context.Background(), id, claimed.LeaseToken, nil); err != nil {
 		t.Fatalf("Ack(%s) 失败: %v", id, err)
 	}
+}
+
+// TestLegacySchemaUpgrade(spec 005,SC-006)存量库升级:用旧 schema(无
+// business_key/replay_of 列)手工建库,Open 后必须完成幂等迁移——旧任务可读、
+// 字段解释正确(ID 即 ExecutionID、无键无重放来源),新写路径(键幂等/Replay)可用。
+func TestLegacySchemaUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	// 用旧版列清单手工建表并塞一条"历史任务"(模拟 spec 004 时代写入的数据)。
+	legacy, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE tasks (
+		id TEXT PRIMARY KEY, type TEXT NOT NULL, queue TEXT NOT NULL, payload BLOB,
+		status TEXT NOT NULL, result BLOB, last_error TEXT NOT NULL DEFAULT '',
+		attempts INTEGER NOT NULL DEFAULT 0, max_retry INTEGER NOT NULL DEFAULT 0,
+		lease_lost INTEGER NOT NULL DEFAULT 0, throttled INTEGER NOT NULL DEFAULT 0,
+		run_at INTEGER NOT NULL, depends_on TEXT NOT NULL DEFAULT '[]',
+		on_parent_fail TEXT NOT NULL DEFAULT 'fail_fast',
+		pending_parents INTEGER NOT NULL DEFAULT 0, lease_token TEXT NOT NULL DEFAULT '',
+		lease_until INTEGER NOT NULL DEFAULT 0, cancel_requested INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL, started_at INTEGER NOT NULL DEFAULT 0,
+		finished_at INTEGER NOT NULL DEFAULT 0);
+		CREATE TABLE task_deps (child_id TEXT NOT NULL, parent_id TEXT NOT NULL,
+		done INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (child_id, parent_id));`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO tasks
+		(id, type, queue, payload, status, run_at, created_at)
+		VALUES ('old-1', 'llm', 'q', X'7B7D', 'completed', 1000, 1000)`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	_ = legacy.Close()
+
+	// 新版本 Open:迁移必须幂等完成,不动存量数据。
+	b, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open 应完成存量库迁移,却失败: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err := b.Init(taskgate.BrokerOptions{Clock: fakeclock.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ctx := context.Background()
+
+	old, err := b.Get(ctx, "old-1")
+	if err != nil {
+		t.Fatalf("存量任务应可读: %v", err)
+	}
+	if old.BusinessKey != "" || old.ReplayOf != "" || old.Status != taskgate.StatusCompleted {
+		t.Fatalf("存量任务字段解释不对: %+v", old)
+	}
+
+	// 新写路径可用:键幂等 + Replay(对存量 completed 任务显式重放)。
+	tk := &taskgate.Task{Type: "llm", Queue: "q", BusinessKey: "new-key"}
+	if err := b.Enqueue(ctx, tk); err != nil {
+		t.Fatalf("迁移后带键入队应可用: %v", err)
+	}
+	if err := b.Enqueue(ctx, &taskgate.Task{Type: "llm", Queue: "q", BusinessKey: "new-key"}); !errors.Is(err, taskgate.ErrTaskExists) {
+		t.Fatalf("迁移后键幂等应生效: %v", err)
+	}
+	nt, err := b.Replay(ctx, taskgate.ReplayRequest{ExecutionID: "old-1", AllowCompleted: true})
+	if err != nil || nt.ReplayOf != "old-1" {
+		t.Fatalf("迁移后对存量任务 Replay 应可用: nt=%+v err=%v", nt, err)
+	}
+
+	// 再 Open 一次:迁移必须幂等(duplicate column 被吞掉)。
+	b2, err := Open(path)
+	if err != nil {
+		t.Fatalf("二次 Open(已迁移库)应幂等成功: %v", err)
+	}
+	_ = b2.Close()
 }

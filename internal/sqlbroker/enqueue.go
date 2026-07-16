@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/AmbroseX/taskgate"
@@ -18,7 +19,21 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	if err := b.requireInit(); err != nil {
 		return err
 	}
+	if t.ReplayOf != "" {
+		// ReplayOf 只能由 Replay 写入:放行会绕过"链不分叉"约束(合同 Enqueue 条款)。
+		return fmt.Errorf("%s: enqueue must not carry ReplayOf (use Replay)", b.dialect.Name())
+	}
 	notifs, err := b.withTx(ctx, func(tx *sql.Tx) ([]taskgate.Task, error) {
+		// 业务键幂等:键下存在任何执行(不论状态)一律拒,错误携带链尾信息。
+		// 这里的 SELECT 只为报错友好;并发窗口由 uq_chain_head 唯一索引兜底(撞索引后
+		// 在下方 INSERT 的错误翻译里重查链尾)。
+		if t.BusinessKey != "" {
+			if te, err := b.taskExistsErr(ctx, tx, t.BusinessKey); err != nil {
+				return nil, err
+			} else if te != nil {
+				return nil, te
+			}
+		}
 		// ID 先在局部变量里生成/使用:全部校验通过、落库成功后才回填,
 		// 报错路径不能让调用方拿到一个根本不存在的孤儿 ID。
 		id := t.ID
@@ -94,13 +109,18 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		}
 
 		if _, err := tx.ExecContext(ctx, b.prep(`INSERT INTO {{t}} (`+taskCols+`)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 			stored.ID, stored.Type, stored.Queue, stored.Payload, string(stored.Status), stored.Result,
 			stored.LastError, stored.Attempts, stored.MaxRetry, stored.LeaseLost, stored.Throttled,
 			ms(stored.RunAt), depsJSON, string(policy), dec.PendingParents, "", int64(0), int64(0),
-			ms(stored.CreatedAt), ms(stored.StartedAt), ms(stored.FinishedAt)); err != nil {
-			// 并发下另一个 Enqueue 抢先插了同 ID:预检没查到但插入撞键,翻译成 ErrTaskExists。
+			ms(stored.CreatedAt), ms(stored.StartedAt), ms(stored.FinishedAt),
+			stored.BusinessKey, stored.ReplayOf); err != nil {
+			// 并发下另一个 Enqueue 抢先插了同 ID 或同链头:预检没查到但插入撞键,
+			// 按撞的约束翻译(撞链头 → errChainHeadDup,withTx 之后重查链尾拼 TaskExistsError)。
 			if b.dialect.IsDuplicateKey(err) {
+				if strings.Contains(b.dialect.DuplicateKeyConstraint(err), "uq_chain_head") {
+					return nil, errChainHeadDup
+				}
 				return nil, fmt.Errorf("%w: %s", taskgate.ErrTaskExists, stored.ID)
 			}
 			return nil, err
@@ -119,6 +139,14 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		}
 		return []taskgate.Task{stored}, nil
 	})
+	if errors.Is(err, errChainHeadDup) {
+		// 撞了链头唯一索引:事务已回滚,库外重查一次链尾把信息带给调用方;
+		// 极端下链尾又被动过就退化成裸 ErrTaskExists,幂等语义不受影响。
+		if te, terr := b.taskExistsErr(ctx, b.db, t.BusinessKey); terr == nil && te != nil {
+			return te
+		}
+		return fmt.Errorf("%w: business key %q", taskgate.ErrTaskExists, t.BusinessKey)
+	}
 	if err != nil {
 		return err
 	}
@@ -126,4 +154,26 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	b.wakeAll()    // 可能有 Dequeue 正等着新任务
 	b.fireNotify(notifs)
 	return nil
+}
+
+// errChainHeadDup 内部哨兵:INSERT 撞 uq_chain_head(并发同键入队输家)。
+// 只在 Enqueue 的 withTx 与错误翻译之间传递,不出包。
+var errChainHeadDup = errors.New("sqlbroker: chain head duplicate")
+
+// taskExistsErr 查键下链尾(最新执行),存在则拼 *TaskExistsError,不存在返回 (nil, nil)。
+func (b *Broker) taskExistsErr(ctx context.Context, q querier, key string) (*taskgate.TaskExistsError, error) {
+	var tailID, tailStatus string
+	err := q.QueryRowContext(ctx, b.prep(`SELECT id, status FROM {{t}}
+		WHERE business_key = ? ORDER BY created_at DESC, id DESC LIMIT 1`), key).Scan(&tailID, &tailStatus)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &taskgate.TaskExistsError{
+		BusinessKey: key,
+		ExecutionID: tailID,
+		Status:      taskgate.Status(tailStatus),
+	}, nil
 }

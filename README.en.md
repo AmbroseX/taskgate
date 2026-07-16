@@ -15,7 +15,7 @@ It is a **library, not a service** — there is no Web UI, it reads no environme
 ## Features
 
 - **Per-type rate limiting**: each queue has its own `{Workers, RPS, Burst}`, so a slow queue never drags down a fast one; `Routes` lets multiple task types share a queue (and thus share one gateway's quota).
-- **Five backends, one contract**: `memorybroker` (in-memory, zero deps), `sqlitebroker` (single-file on disk, pure Go, no cgo), `redisbroker` (multi-process shared, atomic Lua transitions), `pgbroker` (PostgreSQL), `mysqlbroker` (MySQL) — the last two are server-database backends: multi-process shared, exclusive claim via `FOR UPDATE SKIP LOCKED` (requires MySQL 8.0+ / PostgreSQL 9.5+); all five pass the same behavioral contract (`brokertest`, 18 cases).
+- **Five backends, one contract**: `memorybroker` (in-memory, zero deps), `sqlitebroker` (single-file on disk, pure Go, no cgo), `redisbroker` (multi-process shared, atomic Lua transitions), `pgbroker` (PostgreSQL), `mysqlbroker` (MySQL) — the last two are server-database backends: multi-process shared, exclusive claim via `FOR UPDATE SKIP LOCKED` (requires MySQL 8.0+ / PostgreSQL 9.5+); all five pass the same behavioral contract (`brokertest`, 22 cases).
 - **Distributed rate limiting** (redis backend): a queue's Workers/RPS quota is shared across every process connected to the same Redis, so adding machines doesn't mean hammering the gateway; concurrency slots held by a crashed process are reclaimed by lease.
 - **Lease reclaim**: claiming a task takes a lease, heartbeats renew it automatically; after a worker crash the reaper picks tasks back up to rerun, and poison tasks hit a cap and go to the dead-letter state; long tasks can call `RenewLease` inside the handler, or turn off the auto heartbeat per queue and go fully manual (`ManualHeartbeat`). **The price is at-least-once — crash reclaim reruns your handler, so it must be idempotent**; see [The handler contract](#the-handler-contract-must-be-idempotent).
 - **Three retry counters, clear division of labor**: `Attempts` handles business failures (exponential backoff `min(2^n×1s, 10min)±20%`, goes to `failed` past `MaxRetry`), `Throttled` handles gateway rate limiting (`ErrThrottled` doesn't consume retry attempts), `LeaseLost` handles crash reclaim; `ErrSkipRetry` goes straight to dead-letter.
@@ -26,7 +26,7 @@ It is a **library, not a service** — there is no Web UI, it reads no environme
 
 ## Supported backends
 
-All five backends implement the same Broker contract and are verified by the same `brokertest` (18 cases). Switching backends means changing one constructor line — your business code stays untouched. Pick one by deployment shape:
+All five backends implement the same Broker contract and are verified by the same `brokertest` (22 cases). Switching backends means changing one constructor line — your business code stays untouched. Pick one by deployment shape:
 
 | Backend | Fit | Deps | Persistence | Multi-process sharing |
 |---|---|---|---|---|
@@ -141,14 +141,16 @@ g.Handle("summarize", func(ctx context.Context, t *taskgate.Task) ([]byte, error
 
 The process dies inside `db.Save` → the lease expires → the reaper picks it back up and reruns it → **the LLM is called twice and the quota is deducted twice**, while the database holds only one result.
 
-### How to guard: two separate problems
+### How to guard: three separate problems
 
-A rerun hurts two different things. **The remedies are different, and taskgate cannot give you a guarantee for the second one:**
+A rerun hurts three different things. **The remedies differ, and only the first can be fully protected by a local transaction:**
 
-| | Local side effects (quota, DB writes, notifications) | External gateway calls (LLM/OCR) |
-|---|---|---|
-| Can it be prevented? | **Yes**, with `Task.ID` as an idempotency key | **Depends on the gateway** — taskgate can't help |
-| How | DB unique constraint / idempotency table / transactional outbox | If the gateway supports idempotency keys, pass `Task.ID`; if not, you must accept duplicate calls |
+| | Local database side effects (quota deduction, DB writes) | External gateway calls (LLM/OCR) | Async messages/notifications (email, webhook, SMS) |
+|---|---|---|---|
+| Can it be prevented? | **Yes**, with `Task.ID` as an idempotency key | **Depends on the gateway** — taskgate can't help | **Only up to "the intent is recorded exactly once"** — delivery is still at-least-once |
+| How | DB unique constraint / idempotency table, in the same transaction as the business write | If the gateway supports idempotency keys, pass `Task.ID`; if not, you must accept duplicate calls | Transactional outbox: persist "send this notification" within the business transaction; **the sender/receiver must still dedupe by an idempotency key** |
+
+The third category is easy to mistake for the first: an outbox only guarantees that the notification **intent** lives or dies with the business data. The actual send can still happen more than once — recipients of emails and webhooks still see at-least-once delivery, so the idempotency key (e.g. `Task.ID`) must still travel with the message.
 
 #### Local side effects: guard atomically with `Task.ID`
 
@@ -173,10 +175,10 @@ The snippet above **does not stop the LLM from being called twice**. If the proc
 
 This window is the inherent price of at-least-once. There are exactly two ways to deal with it:
 
-- **The gateway supports idempotency keys** (OpenAI's `Idempotency-Key`, most payment gateways): pass `t.ID` through and let the gateway deduplicate, so a rerun produces no second charge. **This is the only way to truly eliminate the duplicate call.**
+- **When the gateway explicitly supports idempotency keys**, pass `t.ID` as the key and let the gateway deduplicate, so a rerun produces no second charge. **This is the only way to truly eliminate the duplicate call.** Payment gateways commonly support this (e.g. Stripe's `Idempotency-Key`); whether an LLM gateway supports it — and on which endpoints — **must be verified against its official documentation**, not assumed.
 - **The gateway doesn't**: accept the cost of duplicate calls, or compensate at the business protocol level (reconciliation, dedup by `t.ID`). taskgate can't help here — the "external call already succeeded but nothing landed locally yet" window cannot be closed by any task queue.
 
-> **`WithID` makes *submission* idempotent, not *execution*.** Submitting the same ID twice returns `ErrTaskExists`, so the task is enqueued only once; but once enqueued, that single task's handler can still run multiple times due to crash reclaim. These are two different things — don't conflate them.
+> **`WithBusinessKey` makes *submission* idempotent, not *execution*.** Submitting the same key twice returns `ErrTaskExists`, so the same piece of work is enqueued only once; but once enqueued, that single task's handler can still run multiple times due to crash reclaim. These are two different things — don't conflate them. (The old `WithID` is deprecated and is now an alias of `WithBusinessKey` — the value you pass is a business key, no longer the task ID.)
 
 > **Do not put critical side effects in `OnStateChange`.** It is an asynchronous notification: no delivery guarantee, no ordering guarantee, a panic in the callback is swallowed, and there is no retry and no "consumed exactly once globally" guarantee. It suits instrumentation and observation that tolerates loss or duplication — it cannot carry billing, notifications, or business-final writes.
 
@@ -196,7 +198,7 @@ return nil, err                                                 // ordinary busi
 
 > **Note**: `ErrThrottled` / `ErrSkipRetry` must be returned **by value** (`errors.As` matches by value); do not return a pointer to them.
 
-Submit options: `WithID` (idempotent dedup), `Delay` / `RunAt` (delayed execution), `MaxRetry`, `DependsOn`, `IgnoreParentFailure`.
+Submit options: `WithBusinessKey` (business idempotency key; the old `WithID` is deprecated as its alias), `Delay` / `RunAt` (delayed execution), `MaxRetry`, `DependsOn`, `IgnoreParentFailure`.
 
 ## Long tasks and manual lease renewal
 
@@ -301,13 +303,13 @@ Default prefix `tg:` (changeable via `Options.KeyPrefix`). No need to go through
 
 ### Testing and limitations
 
-- **Two-tier contract tests**: the miniredis tier runs offline in CI; set `TASKGATE_REDIS_ADDR=127.0.0.1:6379` and the same 18 contract cases run again against real Redis (isolated by random KeyPrefix, cleaned up afterward) to verify Lua script compatibility.
+- **Two-tier contract tests**: the miniredis tier runs offline in CI; set `TASKGATE_REDIS_ADDR=127.0.0.1:6379` and the same 22 contract cases run again against real Redis (isolated by random KeyPrefix, cleaned up afterward) to verify Lua script compatibility.
 - **Redis Cluster not supported**: keys are built by prefix inside the scripts and carry no hash tag; targets single-instance / primary-replica / sentinel topologies.
 - **Limiter keys and task keys live in the same Redis instance**: a flushdb-level failure takes both down together (an honest trade-off).
 
 ## SQL backends: PostgreSQL / MySQL (multi-process)
 
-Use these when you already run a PostgreSQL or MySQL and don't want to bring in a Redis: multiple worker processes connect to the same database and race for the same batch of tasks, with exclusive claim via `FOR UPDATE SKIP LOCKED` (requires MySQL 8.0+ / PostgreSQL 9.5+), and they pass the same 18 contract cases. Just like redis, switching backends means changing one constructor line — your business code stays untouched:
+Use these when you already run a PostgreSQL or MySQL and don't want to bring in a Redis: multiple worker processes connect to the same database and race for the same batch of tasks, with exclusive claim via `FOR UPDATE SKIP LOCKED` (requires MySQL 8.0+ / PostgreSQL 9.5+), and they pass the same 22 contract cases. Just like redis, switching backends means changing one constructor line — your business code stays untouched:
 
 ```go
 import "github.com/AmbroseX/taskgate/pgbroker"
@@ -389,6 +391,19 @@ task, err := g.Get(ctx, id)
 // Backlog & in-flight for a queue / global per-state counts.
 stats, _ := g.Stats(ctx, "llm")
 overview, _ := g.Overview(ctx)
+
+// Idempotent submission + replay (spec 005): the task ID (ExecutionID) is system-generated;
+// the business key is a separate concept. A final execution can be replayed into a NEW
+// execution — the old record is never mutated, and `ReplayOf` points back for audit.
+id, err := g.Submit(ctx, "generate", payload, taskgate.WithBusinessKey("order-42"))
+var te *taskgate.TaskExistsError
+if errors.As(err, &te) && te.Status == taskgate.StatusFailed {
+    newID, _ := g.Replay(ctx, te.ExecutionID) // rerun the failed work under the same key
+    _ = newID
+}
+g.Replay(ctx, id, taskgate.AllowCompleted())        // replaying a completed execution must be explicit
+g.Replay(ctx, id, taskgate.WithPayload(newPayload)) // fix the payload before rerunning (copied by default)
+history, _ := g.History(ctx, "order-42")            // execution chain under the key (oldest → newest)
 ```
 
 ## Typed errors
@@ -397,7 +412,7 @@ All errors are exported; check them with `errors.Is` / `errors.As`:
 
 ```go
 // Sentinel errors (errors.Is)
-taskgate.ErrTaskExists    // a task with the same ID already exists (hit on WithID idempotent dedup)
+taskgate.ErrTaskExists    // the business key already has executions (hit on WithBusinessKey dedup; errors.As gives *TaskExistsError with the chain tail)
 taskgate.ErrTaskNotFound  // task does not exist (Get/Cancel miss, or a depended-on parent is missing)
 taskgate.ErrLeaseLost     // lease token mismatch: task already reclaimed or re-claimed by someone else, result void
 taskgate.ErrTaskCanceled  // task was flagged for cancellation, the handler should exit
@@ -405,6 +420,9 @@ taskgate.ErrAlreadyFinal  // Cancel on a task already in a final state
 taskgate.ErrUnknownType   // Run hit a task type with no registered handler
 taskgate.ErrShutdown      // Gate already Shutdown, new submissions rejected
 taskgate.ErrNoTask        // RenewLease called on a ctx outside a handler
+taskgate.ErrReplayNotFinal      // Replay target is not in a final state yet
+taskgate.ErrAlreadyReplayed     // Replay target was already replayed (history chains never fork)
+taskgate.ErrCompletedNotAllowed // replaying a completed execution requires AllowCompleted()
 
 // Structured errors (errors.As; handlers return them to control the retry path, must be returned by value)
 taskgate.ErrThrottled{RetryAfter: d} // gateway rate limit: requeue later, doesn't consume retry attempts
@@ -419,7 +437,7 @@ The whole suite runs offline (L1 unit → L2 brokertest contract → L3 integrat
 go test ./... -race
 ```
 
-To run the 18 contract cases against real databases as well (optional; Redis verifies Lua script compatibility, PG/MySQL auto-skip when no database is available locally):
+To run the 22 contract cases against real databases as well (optional; Redis verifies Lua script compatibility, PG/MySQL auto-skip when no database is available locally):
 
 ```bash
 TASKGATE_REDIS_ADDR=127.0.0.1:6379 go test ./redisbroker/... -race

@@ -2,6 +2,7 @@ package taskgate
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -40,6 +41,7 @@ type Broker interface {
 	Requeue(ctx context.Context, id, leaseToken string) error
 	Heartbeat(ctx context.Context, id, leaseToken string) error
 	Get(ctx context.Context, id string) (*Task, error)
+	Replay(ctx context.Context, req ReplayRequest) (*Task, error)
 	List(ctx context.Context, f Filter) ([]*Task, error)
 	QueueLen(ctx context.Context, queue string) (int, error)
 	Counts(ctx context.Context) (map[string]map[Status]int64, error)
@@ -73,9 +75,20 @@ type LimiterProvider interface {
 //   - Offset ≥ 匹配总数 → 返回空列表(nil error);Offset < 0 按 0 处理;
 //   - 翻页弱一致:翻页期间数据变动不承诺快照一致,只承诺"未变动的任务不丢不重"。
 type Filter struct {
-	Type   string
-	Queue  string
-	Status Status
-	Limit  int // 0=不限
-	Offset int // 排序后跳过的条数,0=不跳过
+	Type        string
+	Queue       string
+	Status      Status
+	BusinessKey string // 非空时只返回该业务键下的执行;与其余条件是 AND 关系
+	Limit       int    // 0=不限
+	Offset      int    // 排序后跳过的条数,0=不跳过
+}
+
+// ReplayRequest Replay 的入参:目标用 ExecutionID 或 BusinessKey 指定,恰好一个非空。
+// 按键指定时天然作用于链尾(该键下最新执行)。整个校验+创建必须在后端一个原子单位
+// (同事务/同 Lua/同临界区)内完成,行为合同见 specs/005-identity-replay/contracts/。
+type ReplayRequest struct {
+	ExecutionID    string          // 目标执行,必须是其链的链尾
+	BusinessKey    string          // 与 ExecutionID 二选一
+	AllowCompleted bool            // 重放 completed 必须显式打开
+	Payload        json.RawMessage // nil = 复制目标执行的 Payload;非 nil 即覆盖
 }

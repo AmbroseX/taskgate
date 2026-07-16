@@ -23,10 +23,22 @@ CREATE TABLE IF NOT EXISTS tasks (
 
     created_at      INTEGER NOT NULL,
     started_at      INTEGER NOT NULL DEFAULT 0,
-    finished_at     INTEGER NOT NULL DEFAULT 0
+    finished_at     INTEGER NOT NULL DEFAULT 0,
+
+    -- Identity 身份模型(spec 005):业务幂等键 + 重放来源指针,创建后均不可变。
+    business_key    TEXT NOT NULL DEFAULT '',
+    replay_of       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_claim ON tasks(queue, status, run_at);
 CREATE INDEX IF NOT EXISTS idx_status ON tasks(status, lease_until);
+-- 不变式 1(链头唯一):同键下 replay_of 为空的行至多一条 → 并发同键入队兜底。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_chain_head
+    ON tasks(business_key) WHERE business_key <> '' AND replay_of = '';
+-- 不变式 2(重放来源唯一):链不分叉 → 并发同目标 Replay 兜底。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_replay_of
+    ON tasks(replay_of) WHERE replay_of <> '';
+-- 按键查询(Filter.BusinessKey / History)。
+CREATE INDEX IF NOT EXISTS idx_business_key ON tasks(business_key) WHERE business_key <> '';
 CREATE TABLE IF NOT EXISTS task_deps (
     child_id  TEXT NOT NULL,
     parent_id TEXT NOT NULL,

@@ -36,6 +36,10 @@ func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task,
 		conds = append(conds, "status = ?")
 		args = append(args, string(f.Status))
 	}
+	if f.BusinessKey != "" {
+		conds = append(conds, "business_key = ?")
+		args = append(args, f.BusinessKey)
+	}
 	for i, c := range conds {
 		if i == 0 {
 			query += " WHERE " + c

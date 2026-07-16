@@ -65,7 +65,9 @@ const (
 
 // Task 任务实体。字段语义照 data-model.md 第 1 节,Payload/Result 一律 json.RawMessage。
 type Task struct {
-	ID              string              `json:"id"`                // 空则由 broker 生成 ulid;自定义 ID 可做幂等去重
+	ID              string              `json:"id"`                     // ExecutionID:一次执行的永久身份,broker 生成 ulid,永不复用;公开 API 不提供写入口
+	BusinessKey     string              `json:"business_key,omitempty"` // 业务幂等键:同键下存在任何执行则 Enqueue 拒绝;创建后不可变
+	ReplayOf        string              `json:"replay_of,omitempty"`    // 本执行重放自哪个 ExecutionID;由 Replay 写入,创建后不可变
 	Type            string              `json:"type"`              // 决定 handler 和默认队列
 	Queue           string              `json:"queue"`             // 限流单元,入队那一刻定死
 	Payload         json.RawMessage     `json:"payload,omitempty"` // 入参
@@ -211,7 +213,7 @@ func (c *Config) validate() error {
 
 // submitOptions 收集提交选项,由 client.Submit 消费(Delay 需要在提交那一刻换算成 RunAt)。
 type submitOptions struct {
-	id                  string
+	businessKey         string
 	delay               time.Duration
 	runAt               time.Time
 	maxRetry            int
@@ -222,9 +224,20 @@ type submitOptions struct {
 // SubmitOption 提交任务时的函数式选项。
 type SubmitOption func(*submitOptions)
 
-// WithID 自定义任务 ID,用来做幂等去重;重复提交同 ID 会拿到 ErrTaskExists。
+// WithBusinessKey 业务幂等键:同键下已存在任何执行(不论状态)时 Submit 拒绝,
+// 错误满足 errors.Is(err, ErrTaskExists),且可 errors.As 出 *TaskExistsError 拿到
+// 链尾执行的 ID 与状态。失败后想再跑同一件事,走 Replay,不走再次 Submit。
+func WithBusinessKey(key string) SubmitOption {
+	return func(o *submitOptions) { o.businessKey = key }
+}
+
+// WithID 旧的"自定义任务 ID"选项。
+//
+// Deprecated: 任务 ID(ExecutionID)已收紧为系统生成,用户不可指定;本选项现在
+// 等同于 WithBusinessKey——传入的值成为业务幂等键,不再是任务 ID,**不能**拿去
+// Get/DependsOn(那两处只认 Submit 返回的 ID)。新代码请直接用 WithBusinessKey。
 func WithID(id string) SubmitOption {
-	return func(o *submitOptions) { o.id = id }
+	return WithBusinessKey(id)
 }
 
 // Delay 延迟 d 之后才允许执行(提交时换算成 RunAt)。
@@ -255,6 +268,36 @@ func IgnoreParentFailure() SubmitOption {
 // applySubmitOptions 把选项收拢成一个结构,给 Submit 和单测用。
 func applySubmitOptions(opts ...SubmitOption) submitOptions {
 	var o submitOptions
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// replayOptions 收集重放选项,由 Gate.Replay / Gate.ReplayByKey 消费。
+type replayOptions struct {
+	allowCompleted bool
+	payload         json.RawMessage // nil = 复制目标执行的 Payload
+}
+
+// ReplayOption 重放时的函数式选项。
+type ReplayOption func(*replayOptions)
+
+// AllowCompleted 显式允许重放 completed 的执行("重新生成报告"这类主动重跑)。
+// 不带它重放 completed 会拿到 ErrCompletedNotAllowed——防止误触发重复计费。
+func AllowCompleted() ReplayOption {
+	return func(o *replayOptions) { o.allowCompleted = true }
+}
+
+// WithPayload 用新 Payload 重放(参数修正后重跑)。不带它默认复制目标执行的 Payload;
+// 要显式清空就传 json.RawMessage("null") 或 "{}"——nil 表示"没传",非 nil 即覆盖。
+func WithPayload(p json.RawMessage) ReplayOption {
+	return func(o *replayOptions) { o.payload = p }
+}
+
+// applyReplayOptions 把重放选项收拢成一个结构。
+func applyReplayOptions(opts ...ReplayOption) replayOptions {
+	var o replayOptions
 	for _, fn := range opts {
 		fn(&o)
 	}

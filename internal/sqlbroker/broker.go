@@ -37,7 +37,7 @@ func TotalRetries() int64 { return totalRetries.Load() }
 const taskCols = `id, type, queue, payload, status, result, last_error,
 	attempts, max_retry, lease_lost, throttled, run_at, depends_on, on_parent_fail,
 	pending_parents, lease_token, lease_until, cancel_requested,
-	created_at, started_at, finished_at`
+	created_at, started_at, finished_at, business_key, replay_of`
 
 // Config 共享核心的运行参数,由薄壳包从各自 Options 映射而来(零值补默认)。
 type Config struct {
@@ -151,6 +151,9 @@ func (b *Broker) ensureSchema(ctx context.Context) error {
 
 	for _, ddl := range b.dialect.SchemaSQL(b.cfg.TablePrefix) {
 		if _, err := conn.ExecContext(ctx, ddl); err != nil {
+			if b.dialect.IsIdempotentDDLErr(err) {
+				continue // 存量表升级的 ALTER 撞"列/索引已存在":幂等跳过(spec 005 迁移)
+			}
 			return fmt.Errorf("%s: apply schema: %w", b.dialect.Name(), err)
 		}
 	}
@@ -336,7 +339,7 @@ func scanRec(s rowScanner) (*rec, error) {
 	err := s.Scan(&r.task.ID, &r.task.Type, &r.task.Queue, &payload, &status, &result,
 		&r.task.LastError, &r.task.Attempts, &r.task.MaxRetry, &r.task.LeaseLost, &r.task.Throttled,
 		&runAt, &deps, &policy, &r.pendingParents, &r.task.LeaseToken, &until, &cancelReq,
-		&created, &start, &finished)
+		&created, &start, &finished, &r.task.BusinessKey, &r.task.ReplayOf)
 	if err != nil {
 		return nil, err
 	}

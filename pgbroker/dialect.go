@@ -70,10 +70,23 @@ func (pgDialect) SchemaSQL(prefix string) []string {
 			cancel_requested BIGINT NOT NULL DEFAULT 0,
 			created_at       BIGINT NOT NULL,
 			started_at       BIGINT NOT NULL DEFAULT 0,
-			finished_at      BIGINT NOT NULL DEFAULT 0
+			finished_at      BIGINT NOT NULL DEFAULT 0,
+			business_key     TEXT NOT NULL DEFAULT '',
+			replay_of        TEXT NOT NULL DEFAULT ''
 		)`,
+		// 存量表升级(spec 005,幂等):spec 004 建的表没有这两列,补上;新表是空操作。
+		`ALTER TABLE ` + tasks + ` ADD COLUMN IF NOT EXISTS business_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + tasks + ` ADD COLUMN IF NOT EXISTS replay_of TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS ` + prefix + `idx_claim ON ` + tasks + ` (queue, status, run_at)`,
 		`CREATE INDEX IF NOT EXISTS ` + prefix + `idx_status ON ` + tasks + ` (status, lease_until)`,
+		// 不变式 1(链头唯一):同键下 replay_of 为空的行至多一条 → 并发同键入队兜底(spec 005)。
+		`CREATE UNIQUE INDEX IF NOT EXISTS ` + prefix + `uq_chain_head ON ` + tasks +
+			` (business_key) WHERE business_key <> '' AND replay_of = ''`,
+		// 不变式 2(重放来源唯一):链不分叉 → 并发同目标 Replay 兜底(spec 005)。
+		`CREATE UNIQUE INDEX IF NOT EXISTS ` + prefix + `uq_replay_of ON ` + tasks +
+			` (replay_of) WHERE replay_of <> ''`,
+		`CREATE INDEX IF NOT EXISTS ` + prefix + `idx_business_key ON ` + tasks +
+			` (business_key) WHERE business_key <> ''`,
 		`CREATE TABLE IF NOT EXISTS ` + deps + ` (
 			child_id  TEXT NOT NULL,
 			parent_id TEXT NOT NULL,
@@ -84,11 +97,23 @@ func (pgDialect) SchemaSQL(prefix string) []string {
 	}
 }
 
-// IsDuplicateKey PG 主键冲突 SQLSTATE 23505。errors.As 到驱动错误类型再看码,禁字符串匹配。
+// IsDuplicateKey PG 唯一约束冲突 SQLSTATE 23505。errors.As 到驱动错误类型再看码,禁字符串匹配。
 func (pgDialect) IsDuplicateKey(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
+
+// DuplicateKeyConstraint 撞的约束/索引名:PG 有结构化字段,直接取。
+func (pgDialect) DuplicateKeyConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return pgErr.ConstraintName
+	}
+	return ""
+}
+
+// IsIdempotentDDLErr PG 的 DDL 全部用 IF NOT EXISTS 表达,不存在良性重复错误。
+func (pgDialect) IsIdempotentDDLErr(error) bool { return false }
 
 // Retryable PG 死锁 40P01 / 序列化失败 40001 都是数据库立即返回,可立即重试。
 func (pgDialect) Retryable(err error) sqlbroker.RetryClass {

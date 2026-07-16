@@ -1,5 +1,6 @@
 // Package brokertest 是 Broker 行为契约的统一验收套件。
-// memory/sqlite/redis 三个后端跑同一套 18 条契约用例(见 contracts/broker-contract.md),
+// memory/sqlite/redis/pg/mysql 五个后端跑同一套 22 条契约用例(见 contracts/broker-contract.md
+// 与 specs/005-identity-replay/contracts/broker-contract-delta.md),
 // 用例只断言语义、不断言实现手段:后端用轮询还是 Cond 唤醒都算合法,只要行为对。
 // 时间一律用 fakeclock 手动推进,禁止真 sleep;唯一的例外是阻塞语义用例里
 // 等 goroutine 结果的短观察窗,并且全部带超时保护。
@@ -41,10 +42,11 @@ type contractCase struct {
 	notify bool
 }
 
-// allCases 18 条契约,顺序与 contracts/broker-contract.md 的清单一致。
+// allCases 22 条契约,顺序与 contracts/broker-contract.md 及
+// specs/005-identity-replay/contracts/broker-contract-delta.md 的清单一致。
 var allCases = []contractCase{
 	{name: "RoundTrip", run: caseRoundTrip},
-	{name: "IdempotentID", run: caseIdempotentID},
+	{name: "BusinessKeyIdempotent", run: caseBusinessKeyIdempotent},
 	{name: "ClaimMutex", run: caseClaimMutex},
 	{name: "BlockingDequeue", run: caseBlockingDequeue},
 	{name: "DelayedTask", run: caseDelayedTask},
@@ -62,9 +64,13 @@ var allCases = []contractCase{
 	{name: "IllegalTransition", run: caseIllegalTransition},
 	{name: "Notify", run: caseNotify, notify: true},
 	{name: "ListPagination", run: caseListPagination},
+	{name: "ReplayBasic", run: caseReplayBasic},
+	{name: "ReplayChain", run: caseReplayChain},
+	{name: "BusinessKeyQuery", run: caseBusinessKeyQuery},
+	{name: "IdentityRace", run: caseIdentityRace},
 }
 
-// Run 对 factory 构造的后端跑全部 18 条契约。这是所有后端的统一验收入口:
+// Run 对 factory 构造的后端跑全部 22 条契约。这是所有后端的统一验收入口:
 // 后端测试文件里一行 brokertest.Run(t, factory) 即接入。
 func Run(t *testing.T, factory Factory) {
 	for _, c := range allCases {

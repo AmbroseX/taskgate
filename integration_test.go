@@ -279,31 +279,134 @@ func TestStatsConsistency(t *testing.T) {
 	})
 }
 
-// TestIdempotentID 同 ID 二次 Submit → ErrTaskExists,原任务不被覆盖。
-func TestIdempotentID(t *testing.T) {
+// TestBusinessKeyIdempotent(spec 005 重写自 TestIdempotentID)
+// 同键二次 Submit → ErrTaskExists 且可解构链尾;原执行不被覆盖;
+// WithID 作为 Deprecated 别名与 WithBusinessKey 行为完全等同;ID 一律系统生成。
+func TestBusinessKeyIdempotent(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
 		g := newGateOn(t, b, taskgate.Config{
 			Queues: map[string]taskgate.QueueConfig{"idem": {Workers: 1}},
 		})
 		ctx := context.Background()
 
-		id, err := g.Submit(ctx, "idem", json.RawMessage(`{"v":1}`), taskgate.WithID("job-1"))
+		id, err := g.Submit(ctx, "idem", json.RawMessage(`{"v":1}`), taskgate.WithBusinessKey("job-1"))
 		if err != nil {
 			t.Fatalf("首次 Submit 失败: %v", err)
 		}
-		if id != "job-1" {
-			t.Fatalf("自定义 ID 应原样返回,得到 %q", id)
+		if id == "job-1" || id == "" {
+			t.Fatalf("ExecutionID 应由系统生成(不能是业务键),得到 %q", id)
 		}
 
+		// 同键二次提交(WithID 别名路径)→ 拒绝,错误携带链尾。
 		_, err = g.Submit(ctx, "idem", json.RawMessage(`{"v":2}`), taskgate.WithID("job-1"))
 		if !errors.Is(err, taskgate.ErrTaskExists) {
 			t.Fatalf("二次 Submit 应返回 ErrTaskExists,得到: %v", err)
 		}
-
-		// 原任务的 Payload 没被第二次提交覆盖。
-		if got := mustGet(t, g, "job-1"); string(got.Payload) != `{"v":1}` {
-			t.Fatalf("原任务被覆盖了: %s", got.Payload)
+		var te *taskgate.TaskExistsError
+		if !errors.As(err, &te) || te.ExecutionID != id || te.BusinessKey != "job-1" {
+			t.Fatalf("错误应携带链尾信息(id=%s key=job-1),得到 %+v", id, te)
 		}
+
+		// 原执行的 Payload 没被第二次提交覆盖;BusinessKey 落库。
+		got := mustGet(t, g, id)
+		if string(got.Payload) != `{"v":1}` || got.BusinessKey != "job-1" {
+			t.Fatalf("原执行被覆盖或键丢失: payload=%s key=%q", got.Payload, got.BusinessKey)
+		}
+	})
+}
+
+// TestReplayFlow(spec 005,US1+US2)cron 配方端到端:真调度下失败 → 从拒绝错误里拿链尾
+// → Replay → 新执行跑完;旧执行逐字段不变;History 链序;并发 Replay 恰一个成功。
+func TestReplayFlow(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, b taskgate.Broker) {
+		g := newGateOn(t, b, taskgate.Config{
+			Queues: map[string]taskgate.QueueConfig{"report": {Workers: 2}},
+		})
+		var fail atomic.Bool
+		fail.Store(true)
+		g.Handle("report", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+			if fail.Load() {
+				return nil, taskgate.ErrSkipRetry{Err: errors.New("gateway 500")}
+			}
+			return []byte(`"ok"`), nil
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runDone := make(chan error, 1)
+		go func() { runDone <- g.Run(ctx) }()
+
+		// E1 失败(FailSkip → failed)。
+		e1, err := g.Submit(ctx, "report", json.RawMessage(`{"day":"2026-07-16"}`),
+			taskgate.WithBusinessKey("daily:2026-07-16"))
+		if err != nil {
+			t.Fatalf("Submit E1 失败: %v", err)
+		}
+		if _, err := g.Wait(ctx, e1); err == nil {
+			t.Fatal("E1 应以失败告终")
+		}
+		before := mustGet(t, g, e1)
+
+		// cron 再触发:被拒 → 从错误里直接拿链尾状态,决定 Replay。
+		_, err = g.Submit(ctx, "report", json.RawMessage(`{"day":"2026-07-16"}`),
+			taskgate.WithBusinessKey("daily:2026-07-16"))
+		var te *taskgate.TaskExistsError
+		if !errors.As(err, &te) || te.ExecutionID != e1 || te.Status != taskgate.StatusFailed {
+			t.Fatalf("重复触发应拒且带链尾 failed 状态,得到 err=%v te=%+v", err, te)
+		}
+
+		// 并发 Replay 同目标:恰好一个成功(Gate 层竞态,-race 下验)。
+		fail.Store(false)
+		const n = 8
+		type res struct {
+			id  string
+			err error
+		}
+		results := make(chan res, n)
+		for i := 0; i < n; i++ {
+			go func() {
+				id, err := g.Replay(ctx, te.ExecutionID)
+				results <- res{id, err}
+			}()
+		}
+		var e2 string
+		okN := 0
+		for i := 0; i < n; i++ {
+			r := <-results
+			switch {
+			case r.err == nil:
+				okN++
+				e2 = r.id
+			case errors.Is(r.err, taskgate.ErrAlreadyReplayed):
+			default:
+				t.Fatalf("并发 Replay 输家应拿 ErrAlreadyReplayed,得到 %v", r.err)
+			}
+		}
+		if okN != 1 {
+			t.Fatalf("并发 Replay 应恰好 1 个成功,得到 %d", okN)
+		}
+
+		// 新执行跑完;旧执行逐字段不变。
+		if out, err := g.Wait(ctx, e2); err != nil || string(out) != `"ok"` {
+			t.Fatalf("重放执行应成功跑完,得到 out=%s err=%v", out, err)
+		}
+		after := mustGet(t, g, e1)
+		if after.Status != before.Status || after.LastError != before.LastError ||
+			string(after.Result) != string(before.Result) || !after.FinishedAt.Equal(before.FinishedAt) {
+			t.Fatalf("Replay 后旧执行被改写:\nbefore=%+v\nafter=%+v", before, after)
+		}
+		e2Task := mustGet(t, g, e2)
+		if e2Task.ReplayOf != e1 || e2Task.BusinessKey != "daily:2026-07-16" {
+			t.Fatalf("新执行链字段不对: %+v", e2Task)
+		}
+
+		// History 链序:[E1, E2]。
+		hist, err := g.History(ctx, "daily:2026-07-16")
+		if err != nil || len(hist) != 2 || hist[0].ID != e1 || hist[1].ID != e2 {
+			t.Fatalf("History 应为 [E1 E2],得到 %d 条 err=%v", len(hist), err)
+		}
+
+		cancel()
+		<-runDone
 	})
 }
 

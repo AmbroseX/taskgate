@@ -13,6 +13,7 @@ local function kTask(id) return P .. 'task:' .. id end
 local function kPending(q) return P .. 'pending:' .. q end
 local function kDelayed(q) return P .. 'delayed:' .. q end
 local function kChildren(id) return P .. 'children:' .. id end
+local function kBk(key) return P .. 'bk:' .. key end
 local function kIdxStatus(s) return P .. 'idx:status:' .. s end
 local function kIdxType(t) return P .. 'idx:type:' .. t end
 local kInflight = P .. 'inflight'

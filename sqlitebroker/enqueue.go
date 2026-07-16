@@ -18,8 +18,30 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	if err := b.requireInit(); err != nil {
 		return err
 	}
+	if t.ReplayOf != "" {
+		// ReplayOf 只能由 Replay 写入:放行会绕过"链不分叉"约束(合同 Enqueue 条款)。
+		return errors.New("sqlitebroker: enqueue must not carry ReplayOf (use Replay)")
+	}
 	var stored taskgate.Task
 	err := b.withTx(ctx, func(tx *sql.Tx) error {
+		// 业务键幂等:键下存在任何执行(不论状态)一律拒,错误携带链尾信息。
+		// 事务内检查(BEGIN IMMEDIATE 串行化写者),uq_chain_head 唯一索引兜底。
+		if t.BusinessKey != "" {
+			var tailID, tailStatus string
+			err := tx.QueryRowContext(ctx, `SELECT id, status FROM tasks
+				WHERE business_key = ? ORDER BY created_at DESC, id DESC LIMIT 1`,
+				t.BusinessKey).Scan(&tailID, &tailStatus)
+			if err == nil {
+				return &taskgate.TaskExistsError{
+					BusinessKey: t.BusinessKey,
+					ExecutionID: tailID,
+					Status:      taskgate.Status(tailStatus),
+				}
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
 		// ID 先在局部变量里生成/使用:全部校验通过、落库成功后才回填 t.ID,
 		// 报错路径不能让调用方拿到一个根本不存在的孤儿 ID。
 		id := t.ID
@@ -96,11 +118,12 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		}
 
 		if _, err := tx.ExecContext(ctx, `INSERT INTO tasks (`+taskCols+`)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			stored.ID, stored.Type, stored.Queue, stored.Payload, string(stored.Status), stored.Result,
 			stored.LastError, stored.Attempts, stored.MaxRetry, stored.LeaseLost, stored.Throttled,
 			ms(stored.RunAt), depsJSON, string(policy), dec.PendingParents, "", 0, 0,
-			ms(stored.CreatedAt), ms(stored.StartedAt), ms(stored.FinishedAt)); err != nil {
+			ms(stored.CreatedAt), ms(stored.StartedAt), ms(stored.FinishedAt),
+			stored.BusinessKey, stored.ReplayOf); err != nil {
 			return err
 		}
 		// 登记依赖边(去重后的父列表);父已是终态的边直接标 done,传播时不再依赖它。

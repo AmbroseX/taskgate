@@ -43,8 +43,11 @@ var (
 	luaHeartbeat string
 	//go:embed lua/reap.lua
 	luaReap string
+	//go:embed lua/replay.lua
+	luaReplay string
 
 	scriptEnqueue   = redis.NewScript(luaCommon + "\n" + luaEnqueue)
+	scriptReplay    = redis.NewScript(luaCommon + "\n" + luaReplay)
 	scriptClaim     = redis.NewScript(luaCommon + "\n" + luaClaim)
 	scriptFinish    = redis.NewScript(luaCommon + "\n" + luaFinish)
 	scriptHeartbeat = redis.NewScript(luaCommon + "\n" + luaHeartbeat)
@@ -216,6 +219,7 @@ func (b *Broker) kDelayed(q string) string   { return b.prefix + "delayed:" + q 
 func (b *Broker) kIdxStatus(s string) string { return b.prefix + "idx:status:" + s }
 func (b *Broker) kIdxType(typ string) string { return b.prefix + "idx:type:" + typ }
 func (b *Broker) kStats() string             { return b.prefix + "stats" }
+func (b *Broker) kBk(key string) string      { return b.prefix + "bk:" + key }
 
 // ---- 错误映射(research 第 9 节) ----
 
@@ -238,6 +242,25 @@ func mapLuaErr(err error) error {
 	switch code {
 	case "exists":
 		return fmt.Errorf("%w: %s", taskgate.ErrTaskExists, detail)
+	case "bk_exists":
+		// detail 形如 "<key>\31<链尾ID>\31<链尾状态>"(\31 分隔,键自身可能含冒号)。
+		if parts := strings.SplitN(detail, "\x1f", 3); len(parts) == 3 {
+			return &taskgate.TaskExistsError{
+				BusinessKey: parts[0],
+				ExecutionID: parts[1],
+				Status:      taskgate.Status(parts[2]),
+			}
+		}
+		return fmt.Errorf("%w: %s", taskgate.ErrTaskExists, detail)
+	case "replay_not_final":
+		if parts := strings.SplitN(detail, "\x1f", 2); len(parts) == 2 {
+			return fmt.Errorf("%w: %s is %s", taskgate.ErrReplayNotFinal, parts[0], parts[1])
+		}
+		return fmt.Errorf("%w: %s", taskgate.ErrReplayNotFinal, detail)
+	case "already_replayed":
+		return fmt.Errorf("%w: %s", taskgate.ErrAlreadyReplayed, detail)
+	case "completed_not_allowed":
+		return fmt.Errorf("%w: %s", taskgate.ErrCompletedNotAllowed, detail)
 	case "not_found":
 		return fmt.Errorf("%w: %s", taskgate.ErrTaskNotFound, detail)
 	case "lease_lost":
@@ -286,6 +309,8 @@ func decodeTask(fields map[string]string) (*taskgate.Task, error) {
 		LastError:       fields["last_error"],
 		OnParentFailure: taskgate.ParentFailurePolicy(fields["on_parent_fail"]),
 		LeaseToken:      fields["lease_token"],
+		BusinessKey:     fields["business_key"], // 旧数据无此字段,缺省空串(spec 005 升级兼容)
+		ReplayOf:        fields["replay_of"],
 	}
 	if v := fields["payload"]; v != "" {
 		t.Payload = []byte(v)

@@ -38,7 +38,7 @@ var testHookBeforeAckCommit func()
 const taskCols = `id, type, queue, payload, status, result, last_error,
 	attempts, max_retry, lease_lost, throttled, run_at, depends_on, on_parent_fail,
 	pending_parents, lease_token, lease_until, cancel_requested,
-	created_at, started_at, finished_at`
+	created_at, started_at, finished_at, business_key, replay_of`
 
 // Broker sqlite 后端。实现 taskgate.Broker。
 type Broker struct {
@@ -66,11 +66,41 @@ func Open(path string) (*Broker, error) {
 	}
 	// 单文件库收紧到 1 个连接:单进程内读写全串行,从根上避开 SQLITE_BUSY。
 	db.SetMaxOpenConns(1)
+	if err := migrateIdentity(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schemaSQL); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlitebroker: apply schema: %w", err)
 	}
 	return &Broker{db: db, wakeCh: make(chan struct{})}, nil
+}
+
+// migrateIdentity 存量库升级(spec 005):给老库补 business_key/replay_of 两列。
+// 必须在跑 schemaSQL 之前执行——schema 里的唯一索引引用这两列,老库没这两列会建索引失败。
+// ALTER 是幂等的:列已存在(新库或已迁移)时报 duplicate column,吞掉即可;零数据改写。
+func migrateIdentity(db *sql.DB) error {
+	var hasTasks int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tasks'`).Scan(&hasTasks)
+	if err != nil {
+		return fmt.Errorf("sqlitebroker: probe schema: %w", err)
+	}
+	if hasTasks == 0 {
+		return nil // 全新库,schemaSQL 直接建全量表
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE tasks ADD COLUMN business_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN replay_of TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column") {
+				continue // 已迁移过,幂等跳过
+			}
+			return fmt.Errorf("sqlitebroker: migrate identity columns: %w", err)
+		}
+	}
+	return nil
 }
 
 // Init 装配运行参数,零值补默认(TTL 60s / LeaseLostMax 3 / ThrottledMax 100 / 真时钟)。
@@ -223,7 +253,7 @@ func scanRec(s rowScanner) (*rec, error) {
 	err := s.Scan(&r.task.ID, &r.task.Type, &r.task.Queue, &payload, &status, &result,
 		&r.task.LastError, &r.task.Attempts, &r.task.MaxRetry, &r.task.LeaseLost, &r.task.Throttled,
 		&runAt, &deps, &policy, &r.pendingParents, &r.task.LeaseToken, &until, &cancelReq,
-		&created, &start, &finished)
+		&created, &start, &finished, &r.task.BusinessKey, &r.task.ReplayOf)
 	if err != nil {
 		return nil, err
 	}

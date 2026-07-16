@@ -22,11 +22,35 @@ func validateID(id string) error {
 	return nil
 }
 
+// validateBusinessKey 校验业务键:同 validateID 挡控制字符(键会拼进 redis key,
+// 且 bk_exists 错误用 \31 分隔字段),另加长度上限防超长 key 注入;空键 = 无键,直接放行。
+func validateBusinessKey(key string) error {
+	if key == "" {
+		return nil
+	}
+	if len(key) > 512 {
+		return fmt.Errorf("redisbroker: business key too long (%d bytes, max 512)", len(key))
+	}
+	for i := 0; i < len(key); i++ {
+		if c := key[i]; c < 0x20 || c == 0x7F {
+			return fmt.Errorf("redisbroker: invalid business key %q: ASCII control characters are not allowed", key)
+		}
+	}
+	return nil
+}
+
 // Enqueue 入队。查重、父校验、初始状态判定、落库全部在 enqueue.lua 一段脚本内原子完成;
 // ID 由 Go 生成注入(脚本内禁 math.random),生成的 ID 与判定结果只在成功后回填 *t——
 // 报错路径不能让调用方拿到一个根本不存在的孤儿 ID(合同 Enqueue 条款)。
 func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	if err := b.requireInit(); err != nil {
+		return err
+	}
+	if t.ReplayOf != "" {
+		// ReplayOf 只能由 Replay 写入:放行会绕过"链不分叉"约束(合同 Enqueue 条款)。
+		return fmt.Errorf("redisbroker: enqueue must not carry ReplayOf (use Replay)")
+	}
+	if err := validateBusinessKey(t.BusinessKey); err != nil {
 		return err
 	}
 	id := t.ID
@@ -71,7 +95,7 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 
 	// 调用方预置的 LastError/StartedAt/FinishedAt 也原样传给脚本落库
 	// (迁移/导入场景会预置这些字段,与 memory/sqlite 的"原样落库"对齐)。
-	args := make([]any, 0, 18+len(uniq))
+	args := make([]any, 0, 19+len(uniq))
 	args = append(args, b.prefix, id, t.Type, t.Queue, string(t.Payload), string(t.Result),
 		t.MaxRetry, t.Attempts, t.LeaseLost, t.Throttled,
 		runAt.UnixMilli(), depsJSON, string(policy), now.UnixMilli(),
@@ -79,6 +103,7 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	for _, pid := range uniq {
 		args = append(args, pid)
 	}
+	args = append(args, t.BusinessKey) // ARGV[19+n],业务键幂等判定(spec 005)
 
 	res, err := scriptEnqueue.Run(ctx, b.rdb, nil, args...).Result()
 	if err != nil {

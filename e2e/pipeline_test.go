@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -510,5 +511,78 @@ func TestE2ESSEHiddenError(t *testing.T) {
 	if throttled.Load() != 2 || gw.BusyCount() != 2 || gw.Requests() != 3 {
 		t.Fatalf("观测不对: handler 判定 %d 次、网关 busy %d 次、总请求 %d(应为 2/2/3)",
 			throttled.Load(), gw.BusyCount(), gw.Requests())
+	}
+}
+
+// TestE2ECronReplay(spec 005 US1)cron 配方端到端:确定性业务键防双触发;
+// 网关故障期任务 failed;从拒绝错误里解构链尾 → Replay → 网关恢复后新执行跑完;
+// 历史链完整可溯源。这是 README cron 配方"失败后死锁"被修复后的完整走法。
+func TestE2ECronReplay(t *testing.T) {
+	ctx := context.Background()
+	gw := mockgw.New()
+	defer gw.Close()
+	// 拿一个必然连接失败的地址模拟"网关故障期":起一个 mockgw 立刻关掉,端口不再监听。
+	dead := mockgw.New()
+	deadURL := dead.URL()
+	dead.Close()
+
+	var gwURL atomic.Value
+	gwURL.Store(deadURL)
+
+	g := newGate(t, taskgate.Config{
+		Queues: map[string]taskgate.QueueConfig{"report": {Workers: 1}},
+	})
+	g.Handle("report", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+		ev, err := callGateway(gwURL.Load().(string), task.Payload)
+		if err != nil {
+			return nil, err // 断连走普通重试路径;MaxRetry(0) 下一次失败即 failed
+		}
+		if !ev.OK {
+			return nil, taskgate.ErrThrottled{RetryAfter: 100 * time.Millisecond}
+		}
+		return ev.Echo, nil
+	})
+	startGate(t, g)
+
+	// cron 触发 1:网关不可达,MaxRetry(0) → 一次失败即 failed,业务键被"占住"。
+	const key = "daily-report:2026-07-16"
+	e1, err := g.Submit(ctx, "report", json.RawMessage(`{"day":"2026-07-16"}`),
+		taskgate.WithBusinessKey(key), taskgate.MaxRetry(0))
+	if err != nil {
+		t.Fatalf("cron 首次 Submit 失败: %v", err)
+	}
+	if _, err := g.Wait(ctx, e1); err == nil {
+		t.Fatal("网关故障期 E1 应以 failed 告终")
+	}
+
+	// cron 触发 2(双触发/重试):同键被拒,且错误里直接带出链尾 failed——不用再查询。
+	_, err = g.Submit(ctx, "report", json.RawMessage(`{"day":"2026-07-16"}`),
+		taskgate.WithBusinessKey(key), taskgate.MaxRetry(0))
+	var te *taskgate.TaskExistsError
+	if !errors.As(err, &te) || te.ExecutionID != e1 || te.Status != taskgate.StatusFailed {
+		t.Fatalf("双触发应被拒且携带链尾 failed,得到 err=%v te=%+v", err, te)
+	}
+
+	// 网关恢复,按链尾 Replay:新执行进入正常调度并跑完。
+	gwURL.Store(gw.URL())
+	e2, err := g.Replay(ctx, te.ExecutionID)
+	if err != nil {
+		t.Fatalf("Replay 失败: %v", err)
+	}
+	out, err := g.Wait(ctx, e2)
+	if err != nil {
+		t.Fatalf("重放执行应成功跑完: %v", err)
+	}
+	if string(out) != `{"day":"2026-07-16"}` {
+		t.Fatalf("重放执行的结果应是网关 echo 的原 Payload,得到 %s", out)
+	}
+
+	// 溯源:历史链 [E1, E2],E2 指回 E1,E1 的失败现场原封不动。
+	hist, err := g.History(ctx, key)
+	if err != nil || len(hist) != 2 || hist[0].ID != e1 || hist[1].ID != e2 {
+		t.Fatalf("History 应为 [E1 E2],得到 %d 条 err=%v", len(hist), err)
+	}
+	if hist[1].ReplayOf != e1 || hist[0].Status != taskgate.StatusFailed {
+		t.Fatalf("链字段不对: E2.ReplayOf=%q E1.Status=%s", hist[1].ReplayOf, hist[0].Status)
 	}
 }

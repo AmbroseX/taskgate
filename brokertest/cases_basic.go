@@ -94,23 +94,68 @@ func caseRoundTrip(t *testing.T, h *harness) {
 	}
 }
 
-// 契约 2 IdempotentID:同 ID 二次入队 → ErrTaskExists,且原任务原封不动。
-func caseIdempotentID(t *testing.T, h *harness) {
-	first := task("dup", "llm", "q")
+// 契约 2 BusinessKeyIdempotent(005 重写):业务幂等从"任务 ID"改到 BusinessKey。
+//   - 同键二次入队(不论首个执行什么状态)→ ErrTaskExists,且可 errors.As 出链尾信息;
+//   - 原执行原封不动;
+//   - 预置 ID 撞主键仍拒(存储防御,原契约 2 的断言保留)。
+func caseBusinessKeyIdempotent(t *testing.T, h *harness) {
+	// (a) 键幂等:首次带键入队成功,BusinessKey 落库往返一致。
+	first := task("", "llm", "q")
+	first.BusinessKey = "bk-dup"
 	first.Payload = []byte(`"original"`)
 	h.enqueue(t, first)
+	if got := h.get(t, first.ID); got.BusinessKey != "bk-dup" {
+		t.Fatalf("BusinessKey 往返不一致: %q != %q", got.BusinessKey, "bk-dup")
+	}
 
-	second := task("dup", "other", "q2")
+	// (b) 同键二次入队 → 拒绝,错误携带链尾(此刻链尾就是首个执行,pending)。
+	second := task("", "other", "q2")
+	second.BusinessKey = "bk-dup"
 	second.Payload = []byte(`"overwrite"`)
 	err := h.b.Enqueue(context.Background(), second)
 	if !errors.Is(err, taskgate.ErrTaskExists) {
-		t.Fatalf("同 ID 二次 Enqueue 应返回 ErrTaskExists,实际 %v", err)
+		t.Fatalf("同键二次 Enqueue 应返回 ErrTaskExists,实际 %v", err)
+	}
+	var te *taskgate.TaskExistsError
+	if !errors.As(err, &te) {
+		t.Fatalf("同键拒绝的错误必须可 errors.As 出 *TaskExistsError,实际 %v", err)
+	}
+	if te.BusinessKey != "bk-dup" || te.ExecutionID != first.ID || te.Status != taskgate.StatusPending {
+		t.Fatalf("TaskExistsError 携带的链尾信息不对: %+v(期望 key=bk-dup id=%s status=pending)", te, first.ID)
 	}
 
-	got := h.get(t, "dup")
+	// (c) 原执行原封不动。
+	got := h.get(t, first.ID)
 	if got.Type != "llm" || got.Queue != "q" || !bytes.Equal(got.Payload, []byte(`"original"`)) {
-		t.Fatalf("二次 Enqueue 不得覆盖原任务,实际变成了 Type=%q Queue=%q Payload=%s",
+		t.Fatalf("二次 Enqueue 不得覆盖原执行,实际变成了 Type=%q Queue=%q Payload=%s",
 			got.Type, got.Queue, got.Payload)
+	}
+
+	// (d) 键下执行进了终态(failed),同键 Submit 依然一律拒(评审确认 #1:失败重跑走 Replay)。
+	claimed := h.dequeue(t, "q")
+	if err := h.b.Fail(context.Background(), claimed.ID, claimed.LeaseToken, "boom",
+		taskgate.FailSkip, time.Time{}); err != nil {
+		t.Fatalf("Fail(FailSkip) 意外失败: %v", err)
+	}
+	h.mustStatus(t, first.ID, taskgate.StatusFailed)
+	err = h.b.Enqueue(context.Background(), taskWithKey("", "llm", "q", "bk-dup"))
+	var te2 *taskgate.TaskExistsError
+	if !errors.As(err, &te2) || te2.Status != taskgate.StatusFailed {
+		t.Fatalf("键下执行已 failed 时同键入队仍应拒且携带 failed 状态,实际 err=%v te=%+v", err, te2)
+	}
+
+	// (e) 预置 ID 撞主键仍拒(存储防御:公开 Submit 不走这条路,测试/嵌入入口走)。
+	dup := task("dup-id", "llm", "q")
+	h.enqueue(t, dup)
+	if err := h.b.Enqueue(context.Background(), task("dup-id", "other", "q2")); !errors.Is(err, taskgate.ErrTaskExists) {
+		t.Fatalf("预置 ID 重复入队应返回 ErrTaskExists,实际 %v", err)
+	}
+
+	// (f) 携带非空 ReplayOf 的 Enqueue 直接拒绝:ReplayOf 只能由 Replay 写入,防绕过链约束。
+	rogue := task("", "llm", "q")
+	rogue.ReplayOf = first.ID
+	if err := h.b.Enqueue(context.Background(), rogue); err == nil {
+		t.Fatal("Enqueue 收到非空 ReplayOf 必须拒绝:ReplayOf 只能由 Replay 写入")
 	}
 }
 

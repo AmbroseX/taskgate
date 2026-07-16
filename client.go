@@ -129,12 +129,12 @@ func (g *Gate) Submit(ctx context.Context, taskType string, payload json.RawMess
 	o := applySubmitOptions(opts...)
 
 	t := &Task{
-		ID:        o.id,
-		Type:      taskType,
-		Queue:     queue,
-		Payload:   payload,
-		MaxRetry:  o.maxRetry,
-		DependsOn: o.dependsOn,
+		BusinessKey: o.businessKey,
+		Type:        taskType,
+		Queue:       queue,
+		Payload:     payload,
+		MaxRetry:    o.maxRetry,
+		DependsOn:   o.dependsOn,
 	}
 	if o.ignoreParentFailure {
 		t.OnParentFailure = IgnoreParentFail
@@ -156,6 +156,39 @@ func (g *Gate) Submit(ctx context.Context, taskType string, payload json.RawMess
 // Get 查单个任务的当前快照。
 func (g *Gate) Get(ctx context.Context, id string) (*Task, error) {
 	return g.broker.Get(ctx, id)
+}
+
+// Replay 按 ExecutionID 重放一次终态执行:创建**新执行**(新 ID、ReplayOf 指回目标、
+// 三计数清零、默认复制目标 Payload)进入正常调度,目标记录逐字段不变。
+// 目标必须是其链的链尾且已终态;completed 需显式 AllowCompleted()。返回新执行的 ID。
+func (g *Gate) Replay(ctx context.Context, executionID string, opts ...ReplayOption) (string, error) {
+	return g.replay(ctx, ReplayRequest{ExecutionID: executionID}, opts...)
+}
+
+// ReplayByKey 按 BusinessKey 重放,天然作用于链尾(该键下最新执行)。语义同 Replay。
+func (g *Gate) ReplayByKey(ctx context.Context, businessKey string, opts ...ReplayOption) (string, error) {
+	return g.replay(ctx, ReplayRequest{BusinessKey: businessKey}, opts...)
+}
+
+// replay 两个重放入口的公共体:套用选项后交给 broker 原子完成。
+func (g *Gate) replay(ctx context.Context, req ReplayRequest, opts ...ReplayOption) (string, error) {
+	if g.isShutdown() {
+		return "", ErrShutdown
+	}
+	o := applyReplayOptions(opts...)
+	req.AllowCompleted = o.allowCompleted
+	req.Payload = o.payload
+	nt, err := g.broker.Replay(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	return nt.ID, nil
+}
+
+// History 枚举该 BusinessKey 下的执行历史链,链序(旧 → 新),链尾即最新执行;
+// 键不存在返回空切片。它是 List(Filter{BusinessKey: key}) 的便捷封装。
+func (g *Gate) History(ctx context.Context, businessKey string) ([]*Task, error) {
+	return g.broker.List(ctx, Filter{BusinessKey: businessKey})
 }
 
 // Cancel 取消任务(US6):

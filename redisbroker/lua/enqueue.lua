@@ -8,6 +8,7 @@
 --       15 last_error | 16 started_at(ms) | 17 finished_at(ms)(15~17 调用方预置值,
 --       原样落库,与 memory/sqlite 对齐;canceled 判定会覆盖 last_error/finished_at)
 --       18 去重后父任务数 n | 19.. n 个父任务 ID(保持 DependsOn 原有顺序)
+--       19+n business_key(spec 005;'' = 无键)
 --
 -- 返回: { 初始状态, LastError }(Go 侧据此回填快照;报错时 Go 不回填 t.ID)
 
@@ -18,6 +19,17 @@ local runAt = ARGV[11]
 local policy = ARGV[13]
 local now = ARGV[14]
 local n = tonumber(ARGV[18])
+local bk = ARGV[19 + n]
+
+-- 业务键幂等(spec 005):键下存在任何执行(不论状态)一律拒,
+-- 错误携带链尾信息(键/链尾ID/状态用 \31 分隔,业务键自身可能含冒号)。
+if bk ~= '' then
+  local tail = redis.call('LINDEX', kBk(bk), -1)
+  if tail then
+    local ts = redis.call('HGET', kTask(tail), 'status')
+    return redis.error_reply('TGERR:bk_exists:' .. bk .. '\31' .. tail .. '\31' .. ts)
+  end
+end
 
 -- 查重:同 ID 已存在 → 拒收,原任务一个字段都不动。
 if redis.call('EXISTS', kTask(id)) == 1 then
@@ -71,7 +83,13 @@ redis.call('HSET', kTask(id),
   'run_at', runAt, 'depends_on', ARGV[12], 'on_parent_fail', policy,
   'pending_parents', pendingParents, 'parents', table.concat(parents, '\31'),
   'lease_token', '', 'lease_until', '0', 'cancel_requested', '0',
-  'created_at', now, 'started_at', ARGV[16], 'finished_at', finishedAt)
+  'created_at', now, 'started_at', ARGV[16], 'finished_at', finishedAt,
+  'business_key', bk, 'replay_of', '')
+
+-- 登记链头(上面已判空,这里必然是键下第一个执行)。
+if bk ~= '' then
+  redis.call('RPUSH', kBk(bk), id)
+end
 
 -- 反向依赖索引:父到终态时按 children:{pid} 找直接子任务(父已终态的也登记,
 -- 传播时由 DecideOnParentFinal 判成不动,语义与 memorybroker 的 children 一致)。

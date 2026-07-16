@@ -33,13 +33,22 @@ type Broker struct {
 	opts   taskgate.BrokerOptions
 	clk    taskgate.Clock
 	recs   map[string]*record
-	inited bool
-	closed bool
+	// Identity 身份模型(spec 005)的链索引,与 recs 同锁维护:
+	// chains 记每个 BusinessKey 下的执行历史链(创建序,链尾即最新);
+	// replayed 记哪些执行已被重放过(链不分叉的判据)。
+	chains   map[string][]string
+	replayed map[string]bool
+	inited   bool
+	closed   bool
 }
 
 // New 构造一个空的内存后端;用之前必须先 Init(由 taskgate.New(cfg) 统一调用)。
 func New() *Broker {
-	b := &Broker{recs: make(map[string]*record)}
+	b := &Broker{
+		recs:     make(map[string]*record),
+		chains:   make(map[string][]string),
+		replayed: make(map[string]bool),
+	}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
@@ -162,6 +171,21 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 		if err := b.requireInit(); err != nil {
 			return nil, err
 		}
+		// ReplayOf 只能由 Replay 写入:放行会绕过"链不分叉"约束(合同 Enqueue 条款)。
+		if t.ReplayOf != "" {
+			return nil, errors.New("memorybroker: enqueue must not carry ReplayOf (use Replay)")
+		}
+		// 业务键幂等:键下存在任何执行(不论状态)一律拒,错误携带链尾信息。
+		if t.BusinessKey != "" {
+			if chain := b.chains[t.BusinessKey]; len(chain) > 0 {
+				tail := b.recs[chain[len(chain)-1]]
+				return nil, &taskgate.TaskExistsError{
+					BusinessKey: t.BusinessKey,
+					ExecutionID: tail.task.ID,
+					Status:      tail.task.Status,
+				}
+			}
+		}
 		// ID 先在局部变量里生成/使用:全部校验通过、落库成功后才回填 t.ID,
 		// 报错路径不能让调用方拿到一个根本不存在的孤儿 ID。
 		id := t.ID
@@ -209,6 +233,10 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 			rec.task.FinishedAt = now
 		}
 		b.recs[rec.task.ID] = rec
+		if rec.task.BusinessKey != "" {
+			// 登记链头(上面已判空,这里必然是键下第一个执行)。
+			b.chains[rec.task.BusinessKey] = append(b.chains[rec.task.BusinessKey], rec.task.ID)
+		}
 
 		// 登记反向索引(去重后的父列表),父到终态时按它找直接子任务。
 		seen := make(map[string]bool, len(parents))
@@ -571,6 +599,80 @@ func (b *Broker) Heartbeat(ctx context.Context, id, leaseToken string) error {
 	return nil
 }
 
+// Replay 重放一次终态执行(spec 005):校验目标(终态/未被重放/completed 需显式允许)
+// 与创建新执行在同一个锁临界区内原子完成——并发同目标重放恰好一个成功。
+// 目标记录零改写;新执行沿用目标的 Type/Queue/MaxRetry/OnParentFailure 与 BusinessKey,
+// 三计数清零、无依赖、pending 落库。
+func (b *Broker) Replay(ctx context.Context, req taskgate.ReplayRequest) (*taskgate.Task, error) {
+	snap, notifs, err := func() (*taskgate.Task, []taskgate.Task, error) {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if err := b.requireInit(); err != nil {
+			return nil, nil, err
+		}
+		if (req.ExecutionID == "") == (req.BusinessKey == "") {
+			return nil, nil, errors.New("memorybroker: replay needs exactly one of ExecutionID / BusinessKey")
+		}
+
+		// 定位目标:按 ID 直取;按键取链尾(最新执行)。
+		var target *record
+		if req.ExecutionID != "" {
+			rec, ok := b.recs[req.ExecutionID]
+			if !ok {
+				return nil, nil, fmt.Errorf("%w: %s", taskgate.ErrTaskNotFound, req.ExecutionID)
+			}
+			target = rec
+		} else {
+			chain := b.chains[req.BusinessKey]
+			if len(chain) == 0 {
+				return nil, nil, fmt.Errorf("%w: business key %q", taskgate.ErrTaskNotFound, req.BusinessKey)
+			}
+			target = b.recs[chain[len(chain)-1]]
+		}
+
+		// 前置校验:终态 → 链尾(未被重放) → completed 显式允许。
+		if !target.task.Status.IsFinal() {
+			return nil, nil, fmt.Errorf("%w: %s is %s", taskgate.ErrReplayNotFinal, target.task.ID, target.task.Status)
+		}
+		if b.replayed[target.task.ID] {
+			return nil, nil, fmt.Errorf("%w: %s", taskgate.ErrAlreadyReplayed, target.task.ID)
+		}
+		if target.task.Status == taskgate.StatusCompleted && !req.AllowCompleted {
+			return nil, nil, fmt.Errorf("%w: %s", taskgate.ErrCompletedNotAllowed, target.task.ID)
+		}
+
+		// 创建新执行。Payload:nil 复制目标,非 nil 用覆盖值。
+		payload := req.Payload
+		if payload == nil {
+			payload = target.task.Payload
+		}
+		now := b.now()
+		rec := &record{task: taskgate.Task{
+			ID:              ulid.Make().String(),
+			BusinessKey:     target.task.BusinessKey,
+			ReplayOf:        target.task.ID,
+			Type:            target.task.Type,
+			Queue:           target.task.Queue,
+			Payload:         append([]byte(nil), payload...),
+			Status:          taskgate.StatusPending,
+			MaxRetry:        target.task.MaxRetry,
+			OnParentFailure: target.task.OnParentFailure,
+			RunAt:           now,
+			CreatedAt:       now,
+		}}
+		b.recs[rec.task.ID] = rec
+		if rec.task.BusinessKey != "" {
+			b.chains[rec.task.BusinessKey] = append(b.chains[rec.task.BusinessKey], rec.task.ID)
+		}
+		b.replayed[target.task.ID] = true
+
+		b.cond.Broadcast() // 新执行进了队列,叫醒等待中的 Dequeue
+		return cloneTask(&rec.task), []taskgate.Task{*cloneTask(&rec.task)}, nil
+	}()
+	b.fireNotify(notifs)
+	return snap, err
+}
+
 // Get 取单个任务的副本。
 func (b *Broker) Get(ctx context.Context, id string) (*taskgate.Task, error) {
 	b.mu.Lock()
@@ -597,6 +699,9 @@ func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task,
 			continue
 		}
 		if f.Status != "" && t.Status != f.Status {
+			continue
+		}
+		if f.BusinessKey != "" && t.BusinessKey != f.BusinessKey {
 			continue
 		}
 		out = append(out, cloneTask(t))

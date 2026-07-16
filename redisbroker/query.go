@@ -45,6 +45,9 @@ func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task,
 	var ids []string
 	var err error
 	switch {
+	case f.BusinessKey != "":
+		// 键链索引就是候选集(最小),剩余条件照旧在 Go 侧过滤。
+		ids, err = b.rdb.LRange(ctx, b.kBk(f.BusinessKey), 0, -1).Result()
 	case f.Status != "":
 		ids, err = b.rdb.SMembers(ctx, b.kIdxStatus(string(f.Status))).Result()
 	case f.Type != "":
@@ -92,6 +95,9 @@ func (b *Broker) List(ctx context.Context, f taskgate.Filter) ([]*taskgate.Task,
 			continue
 		}
 		if f.Status != "" && t.Status != f.Status {
+			continue
+		}
+		if f.BusinessKey != "" && t.BusinessKey != f.BusinessKey {
 			continue
 		}
 		out = append(out, t)

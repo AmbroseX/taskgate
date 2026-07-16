@@ -3,6 +3,7 @@ package taskgate
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -125,8 +126,9 @@ func TestSubmitOptions(t *testing.T) {
 		DependsOn("p3"),
 		IgnoreParentFailure(),
 	)
-	if o.id != "job-1" {
-		t.Errorf("id = %q, want job-1", o.id)
+	// WithID 已是 WithBusinessKey 的 Deprecated 别名(spec 005):值落到 businessKey。
+	if o.businessKey != "job-1" {
+		t.Errorf("businessKey = %q, want job-1", o.businessKey)
 	}
 	if o.delay != 5*time.Second {
 		t.Errorf("delay = %v, want 5s", o.delay)
@@ -146,7 +148,7 @@ func TestSubmitOptions(t *testing.T) {
 
 	// 不给任何选项时全是零值(默认 FailFast、不重试、立即可跑)
 	zero := applySubmitOptions()
-	if zero.id != "" || zero.delay != 0 || !zero.runAt.IsZero() ||
+	if zero.businessKey != "" || zero.delay != 0 || !zero.runAt.IsZero() ||
 		zero.maxRetry != 0 || zero.dependsOn != nil || zero.ignoreParentFailure {
 		t.Errorf("zero options not zero: %+v", zero)
 	}
@@ -269,5 +271,42 @@ func TestErrSkipRetry(t *testing.T) {
 	}
 	if !errors.Is(err, inner) {
 		t.Error("errors.Is should unwrap to inner error")
+	}
+}
+
+// TestReplayOptions 重放选项:零值、AllowCompleted、WithPayload("传了空"与"没传"可区分)。
+func TestReplayOptions(t *testing.T) {
+	zero := applyReplayOptions()
+	if zero.allowCompleted || zero.payload != nil {
+		t.Errorf("zero replay options not zero: %+v", zero)
+	}
+	o := applyReplayOptions(AllowCompleted(), WithPayload(json.RawMessage(`{}`)))
+	if !o.allowCompleted || string(o.payload) != `{}` {
+		t.Errorf("replay options 未生效: %+v", o)
+	}
+	// 显式传空 JSON 是"覆盖成空",不是"没传"。
+	empty := applyReplayOptions(WithPayload(json.RawMessage("null")))
+	if empty.payload == nil {
+		t.Error(`WithPayload("null") 应是非 nil 覆盖值`)
+	}
+}
+
+// TestTaskExistsError 键冲突错误的双通道:errors.Is 兼容旧判错,errors.As 解构链尾。
+func TestTaskExistsError(t *testing.T) {
+	var err error = &TaskExistsError{BusinessKey: "k", ExecutionID: "e1", Status: StatusFailed}
+	if !errors.Is(err, ErrTaskExists) {
+		t.Error("errors.Is(err, ErrTaskExists) 必须成立(存量判错代码零改动)")
+	}
+	var te *TaskExistsError
+	if !errors.As(err, &te) || te.ExecutionID != "e1" || te.Status != StatusFailed || te.BusinessKey != "k" {
+		t.Errorf("errors.As 解构失败: %+v", te)
+	}
+	// 包一层照样能穿透。
+	wrapped := fmt.Errorf("submit: %w", err)
+	if !errors.Is(wrapped, ErrTaskExists) || !errors.As(wrapped, &te) {
+		t.Error("包装后 Is/As 应照样穿透")
+	}
+	if te.Error() == "" {
+		t.Error("Error() 不能为空")
 	}
 }

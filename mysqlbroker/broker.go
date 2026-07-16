@@ -102,6 +102,9 @@ func (b *Broker) Enqueue(ctx context.Context, t *taskgate.Task) error {
 	if err := validateLen("queue", t.Queue); err != nil {
 		return err
 	}
+	if err := validateLen("business_key", t.BusinessKey); err != nil {
+		return err
+	}
 	return b.Broker.Enqueue(ctx, t)
 }
 
