@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支的新提交自动取消旧的在跑任务，省 CI 额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 默认档：miniredis 覆盖 redis 契约，真实网关档自动跳过
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.25.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt 检查（有未格式化文件就失败）
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未 gofmt：" && echo "$unformatted"
+            exit 1
+          fi
+      - name: go test（含竞态检测）
+        run: go test -race -count=1 ./...
+
+  # 真 Redis 档：起一个 redis 服务，跑 redisbroker 的 18 条契约真机版
+  test-redis:
+    name: test (real redis)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: go test（真 Redis 契约档）
+        env:
+          TASKGATE_REDIS_ADDR: 127.0.0.1:6379
+        run: go test -race -count=1 ./redisbroker/...
