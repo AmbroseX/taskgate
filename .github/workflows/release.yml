@@ -1,0 +1,37 @@
+name: Release
+
+# 推 v* tag 时自动建 GitHub Release，Release 正文直接用 annotated tag 的正文
+# （tag 正文由 release-notes skill 生成的中文发布说明）
+on:
+  push:
+    tags: ['v*']
+
+# 建 Release 需要写权限
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 拿到完整 tag 对象，才能读到 annotated tag 正文
+
+      - name: 提取 annotated tag 正文当作 Release 说明
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # 取 tag 正文；去掉首行标题（Release vX.Y.Z），剩下的当 body
+          BODY=$(git tag -l --format='%(contents)' "$TAG" | tail -n +2)
+          {
+            echo "body<<__EOF__"
+            echo "$BODY"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
