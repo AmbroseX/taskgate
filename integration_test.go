@@ -1774,3 +1774,155 @@ func TestManualHeartbeatShutdownTimeout(t *testing.T) {
 		}
 	})
 }
+
+// ---------- spec 006:周期配额 ----------
+
+// statusCount 按 Type 数指定状态的任务数(走 Overview),配额 L3 用。
+func statusCount(t *testing.T, g *taskgate.Gate, typ string, st taskgate.Status) int64 {
+	t.Helper()
+	ov, err := g.Overview(context.Background())
+	if err != nil {
+		t.Fatalf("Overview 失败: %v", err)
+	}
+	return ov[typ][st]
+}
+
+// alignToWindow 睡到下一个 period 边界再回来(带 100ms 余量),
+// 让"每窗口 N 个"的断言不被窗口切换横插一刀。真时间,只在配额 L3 用。
+func alignToWindow(period time.Duration) {
+	now := time.Now()
+	next := now.Truncate(period).Add(period)
+	time.Sleep(time.Until(next) + 100*time.Millisecond)
+}
+
+// TestQuotaExhaustionScheduling(T013,US2)耗尽 = 停止认领而不是报错:
+// 配额内的任务先跑完,剩余滞留 pending、三计数零污染、Stats 位可见,下窗自动恢复。
+func TestQuotaExhaustionScheduling(t *testing.T) {
+	const period = 2 * time.Second
+	b := memorybroker.New()
+	t.Cleanup(func() { _ = b.Close() })
+	g := newGateOn(t, b, taskgate.Config{
+		Queues: map[string]taskgate.QueueConfig{
+			"gw": {Workers: 2, QuotaLimit: 3, QuotaPeriod: taskgate.Duration(period)},
+		},
+	})
+	g.Handle("gw", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+		return []byte(`"ok"`), nil
+	})
+	ctx := context.Background()
+
+	alignToWindow(period)
+	var ids []string
+	for i := 0; i < 5; i++ {
+		id, err := g.Submit(ctx, "gw", nil)
+		if err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	startGate(t, g)
+
+	// 窗口内:恰好 3 个完成,其余老实待在 pending;耗尽不是错误。
+	waitFor(t, period/2, func() bool {
+		return statusCount(t, g, "gw", taskgate.StatusCompleted) == 3
+	}, "本窗口应恰好放行 3 个")
+	if n := statusCount(t, g, "gw", taskgate.StatusPending); n != 2 {
+		t.Fatalf("剩余任务应滞留 pending,实际 pending=%d", n)
+	}
+	if n := statusCount(t, g, "gw", taskgate.StatusFailed); n != 0 {
+		t.Fatalf("配额耗尽不是错误,不得出现 failed,实际 %d", n)
+	}
+	for _, id := range ids {
+		tk := mustGet(t, g, id)
+		if tk.Attempts != 0 || tk.Throttled != 0 || tk.LeaseLost != 0 {
+			t.Fatalf("耗尽不得污染三计数: %+v", tk)
+		}
+	}
+	// 耗尽位可见(等认领循环撞到耗尽后置位)。
+	waitFor(t, period/2, func() bool {
+		st, err := g.Stats(ctx, "gw")
+		return err == nil && st.QuotaExhausted
+	}, "Stats.QuotaExhausted 应为 true")
+
+	// 下个窗口:自动恢复,全部跑完;耗尽位翻回。
+	waitFor(t, 2*period, func() bool {
+		return statusCount(t, g, "gw", taskgate.StatusCompleted) == 5
+	}, "下窗应自动恢复并跑完剩余任务")
+	waitFor(t, period, func() bool {
+		st, err := g.Stats(ctx, "gw")
+		return err == nil && !st.QuotaExhausted
+	}, "恢复后 QuotaExhausted 应翻回 false")
+}
+
+// flakyQuotaBroker 包一层 memorybroker,把配额闸换成可注入故障的版本(T016 用)。
+type flakyQuotaBroker struct {
+	*memorybroker.Broker
+	failing atomic.Bool
+}
+
+func (f *flakyQuotaBroker) QueueQuota(queue string, qc taskgate.QueueConfig) (taskgate.QuotaGate, error) {
+	inner, err := f.Broker.QueueQuota(queue, qc)
+	if err != nil {
+		return nil, err
+	}
+	return &flakyQuotaGate{inner: inner, failing: &f.failing}, nil
+}
+
+type flakyQuotaGate struct {
+	inner   taskgate.QuotaGate
+	failing *atomic.Bool
+}
+
+func (g *flakyQuotaGate) Reserve(ctx context.Context) (*taskgate.QuotaReservation, error) {
+	if g.failing.Load() {
+		return nil, errors.New("quota medium down (injected)")
+	}
+	return g.inner.Reserve(ctx)
+}
+
+func (g *flakyQuotaGate) Release(ctx context.Context, r *taskgate.QuotaReservation) error {
+	return g.inner.Release(ctx, r)
+}
+
+// TestQuotaFailClosed(T016,US3/SC-003)介质不可达 = 零放行 + QuotaStalled 可见,
+// 恢复后自动续上;绝不退回进程内计数。
+func TestQuotaFailClosed(t *testing.T) {
+	fb := &flakyQuotaBroker{Broker: memorybroker.New()}
+	fb.failing.Store(true)
+	t.Cleanup(func() { _ = fb.Close() })
+	g := newGateOn(t, fb, taskgate.Config{
+		Queues: map[string]taskgate.QueueConfig{
+			// 额度给足:本用例只测故障路径,不测耗尽。
+			"gw": {Workers: 2, QuotaLimit: 1000, QuotaPeriod: taskgate.Duration(2 * time.Second)},
+		},
+	})
+	g.Handle("gw", func(ctx context.Context, task *taskgate.Task) ([]byte, error) {
+		return []byte(`"ok"`), nil
+	})
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if _, err := g.Submit(ctx, "gw", nil); err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+	}
+	startGate(t, g)
+
+	// 故障期:零放行,QuotaStalled 可见。
+	waitFor(t, 3*time.Second, func() bool {
+		st, err := g.Stats(ctx, "gw")
+		return err == nil && st.QuotaStalled
+	}, "介质故障应置 QuotaStalled")
+	if n := statusCount(t, g, "gw", taskgate.StatusCompleted); n != 0 {
+		t.Fatalf("fail-closed 期间必须零放行,实际 completed=%d", n)
+	}
+
+	// 恢复:自动续上,全部跑完,stalled 翻回。
+	fb.failing.Store(false)
+	waitFor(t, 5*time.Second, func() bool {
+		return statusCount(t, g, "gw", taskgate.StatusCompleted) == 3
+	}, "介质恢复后应自动续上")
+	waitFor(t, 3*time.Second, func() bool {
+		st, err := g.Stats(ctx, "gw")
+		return err == nil && !st.QuotaStalled
+	}, "恢复后 QuotaStalled 应翻回 false")
+}

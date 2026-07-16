@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -193,6 +194,16 @@ func TestConfigValidateErrors(t *testing.T) {
 		}},
 		{"lease lost max negative", func(c *Config) { c.LeaseLostMax = -1 }},
 		{"throttled max negative", func(c *Config) { c.ThrottledMax = -1 }},
+		// 周期配额(spec 006)的 fail-fast 矩阵。
+		{"quota limit negative", func(c *Config) { c.Queues["q1"] = QueueConfig{Workers: 1, QuotaLimit: -1} }},
+		{"quota period negative", func(c *Config) {
+			c.Queues["q1"] = QueueConfig{Workers: 1, QuotaPeriod: Duration(-time.Second)}
+		}},
+		{"quota limit without period", func(c *Config) { c.Queues["q1"] = QueueConfig{Workers: 1, QuotaLimit: 5} }},
+		{"shared quota key conflicting params", func(c *Config) {
+			c.Queues["q1"] = QueueConfig{Workers: 1, QuotaLimit: 5, QuotaPeriod: Duration(time.Minute), QuotaKey: "gw"}
+			c.Queues["q2"] = QueueConfig{Workers: 1, QuotaLimit: 9, QuotaPeriod: Duration(time.Minute), QuotaKey: "gw"}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -308,5 +319,30 @@ func TestTaskExistsError(t *testing.T) {
 	}
 	if te.Error() == "" {
 		t.Error("Error() 不能为空")
+	}
+}
+
+// TestQuotaConfig 周期配额的合法配置与能力断言(spec 006)。
+func TestQuotaConfig(t *testing.T) {
+	// 同 key 同参数:合法(共享预算)。
+	cfg := validConfig()
+	cfg.Queues["q1"] = QueueConfig{Workers: 1, QuotaLimit: 5, QuotaPeriod: Duration(time.Minute), QuotaKey: "gw"}
+	cfg.Queues["q2"] = QueueConfig{Workers: 1, QuotaLimit: 5, QuotaPeriod: Duration(time.Minute), QuotaKey: "gw"}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("同 key 同参数应合法: %v", err)
+	}
+
+	// 后端不实现 QuotaProvider 却配了配额:New() 必须拒绝启动(没有静默降级)。
+	cfg2 := validConfig()
+	cfg2.Queues["q1"] = QueueConfig{Workers: 1, QuotaLimit: 5, QuotaPeriod: Duration(time.Minute)}
+	_, err := New(cfg2)
+	if err == nil || !strings.Contains(err.Error(), "QuotaProvider") {
+		t.Fatalf("不支持配额的后端应在 New 报错并点名 QuotaProvider,得到: %v", err)
+	}
+
+	// 不配配额时,不支持配额的后端照常可用(QuotaLimit=0 零开销路径)。
+	cfg3 := validConfig()
+	if err := cfg3.validate(); err != nil {
+		t.Fatalf("零配额配置应不受影响: %v", err)
 	}
 }

@@ -12,6 +12,38 @@ import (
 // dequeueRetryWait 后端 Dequeue 出非 ctx 错误时的冷却时间,避免热循环打爆后端。
 const dequeueRetryWait = 100 * time.Millisecond
 
+// quotaRecheckFloor 配额耗尽/介质故障后重试预留的最短间隔(spec 006)。
+const quotaRecheckFloor = 10 * time.Millisecond
+
+// quotaBackoff 耗尽/故障后的重试间隔:min(period/8, 1s),下限 quotaRecheckFloor。
+// 走注入 clock,测试不真 sleep。
+func quotaBackoff(period time.Duration) time.Duration {
+	w := period / 8
+	if w > time.Second {
+		w = time.Second
+	}
+	if w < quotaRecheckFloor {
+		w = quotaRecheckFloor
+	}
+	return w
+}
+
+// quotaDequeueBound 持有预留时 Dequeue 的兜底超时(真时间):它是"预留在手里挂多久"
+// 的安全上界,不是行为语义——QueueLen 启发式已把这条路压成罕见路径,超时只影响
+// 崩溃泄漏的暴露面,测试不依赖它。
+func quotaDequeueBound(period time.Duration) time.Duration {
+	if period < 3*time.Second {
+		return period
+	}
+	return 3 * time.Second
+}
+
+// quotaState 单队列的配额观测位(spec 006),Gate.Stats 读它。
+type quotaState struct {
+	exhausted atomic.Bool // 本窗口额度已尽,认领暂停等下窗
+	stalled   atomic.Bool // 配额介质不可达,fail-closed 暂停中
+}
+
 // scheduler 消费侧编排:每个队列一条认领循环 + Workers 个并发槽,
 // 拿到任务后按 Type 找 handler 执行,成功 Ack、失败按错误分类 Fail。
 // 每个在跑任务配一条心跳 goroutine 自动续租(LeaseTTL/3;队列开了 ManualHeartbeat
@@ -28,6 +60,8 @@ type scheduler struct {
 	runExited chan struct{}
 	// running 每队列"本进程正在执行的任务数",给 Stats 用;没 Run 过的队列读到 0。
 	running map[string]*atomic.Int64
+	// quota 每队列的配额观测位(spec 006);没配配额/没 Run 过的队列不在表里。
+	quota map[string]*quotaState
 
 	// tasks 本进程在跑任务的取消句柄表(id → runningTask),Gate.Cancel 靠它即时打断。
 	tasksMu sync.Mutex
@@ -49,8 +83,19 @@ func newScheduler(g *Gate) *scheduler {
 	return &scheduler{
 		gate:    g,
 		running: make(map[string]*atomic.Int64),
+		quota:   make(map[string]*quotaState),
 		tasks:   make(map[string]*runningTask),
 	}
+}
+
+// quotaStateFor 读某队列的配额观测位,没配配额返回 (false, false)。
+func (s *scheduler) quotaStateFor(queue string) (exhausted, stalled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if qs, ok := s.quota[queue]; ok {
+		return qs.exhausted.Load(), qs.stalled.Load()
+	}
+	return false, false
 }
 
 // track / untrack 登记与注销在跑任务的取消句柄。
@@ -148,19 +193,40 @@ func (s *scheduler) run(ctx context.Context) error {
 	// 跨进程共享限流器,否则退回进程内限流——memory/sqlite 走后一条路,行为与 M1 一致。
 	// 放在锁内做:构造失败时状态还没对外暴露,回滚后 Shutdown/再次 Run 都不受影响。
 	limiters := make(map[string]QueueLimiter, len(queues))
+	quotas := make(map[string]QuotaGate, len(queues))
 	lp, hasLP := s.gate.broker.(LimiterProvider)
+	qp, hasQP := s.gate.broker.(QuotaProvider)
+	rollback := func() {
+		s.started = false
+		s.stopClaims = nil
+		s.runExited = nil
+		s.mu.Unlock()
+	}
 	for name, qc := range queues {
 		if _, ok := s.running[name]; !ok {
 			s.running[name] = &atomic.Int64{}
+		}
+		// 周期配额闸(spec 006):New() 已做过能力断言,这里是防御性双检。
+		if qc.QuotaLimit > 0 {
+			if !hasQP {
+				rollback()
+				return fmt.Errorf("taskgate: queue %q: quota configured but broker does not implement QuotaProvider", name)
+			}
+			qg, qerr := qp.QueueQuota(name, qc)
+			if qerr != nil {
+				rollback()
+				return qerr
+			}
+			quotas[name] = qg
+			if _, ok := s.quota[name]; !ok {
+				s.quota[name] = &quotaState{}
+			}
 		}
 		if hasLP {
 			ql, lerr := lp.QueueLimiter(name, qc)
 			if lerr != nil {
 				// 构造失败:回滚启动标记,Run 返回该错误,之后还能重新 Run。
-				s.started = false
-				s.stopClaims = nil
-				s.runExited = nil
-				s.mu.Unlock()
+				rollback()
 				return lerr
 			}
 			limiters[name] = ql
@@ -190,7 +256,7 @@ func (s *scheduler) run(ctx context.Context) error {
 		claimWG.Add(1)
 		go func(queue string, qc QueueConfig) {
 			defer claimWG.Done()
-			s.claimLoop(ctx, queue, limiters[queue], &workerWG, qc)
+			s.claimLoop(ctx, queue, limiters[queue], quotas[queue], &workerWG, qc)
 		}(name, qc)
 	}
 	claimWG.Wait()  // ctx 取消/Shutdown 后认领循环全部退出
@@ -245,12 +311,16 @@ func (s *scheduler) shutdown(ctx context.Context) error {
 }
 
 // claimLoop 单队列认领循环。
-// 顺序写死:先占并发槽,再等 RPS 令牌,最后才 Dequeue。
+// 顺序写死:先占并发槽 → 等 RPS 令牌 → 预留配额(配了的话)→ 最后才 Dequeue。
 // 为什么先占槽:令牌桶按时间匀速放行,拿了令牌却没槽跑,等槽期间这个令牌等于白烧
 // (启动配额被浪费),Workers 满载时实际吞吐会低于配置的 RPS;
 // 先占槽保证"每个令牌都花在马上能跑的任务上"。
-func (s *scheduler) claimLoop(ctx context.Context, queue string, lim QueueLimiter, workerWG *sync.WaitGroup, qc QueueConfig) {
+// 为什么预留放最后一环(spec 006):预留到认领之间的窗口越短,崩溃泄漏与白烧
+// 暴露面越小;耗尽/介质故障时先释放槽再退避——瞬时持有不算占,不泄漏并发额度。
+func (s *scheduler) claimLoop(ctx context.Context, queue string, lim QueueLimiter, qg QuotaGate, workerWG *sync.WaitGroup, qc QueueConfig) {
 	cnt := s.running[queue]
+	qs := s.quota[queue] // 配了配额才非 nil(与 qg 同生共死)
+	quotaWait := quotaBackoff(time.Duration(qc.QuotaPeriod))
 	for {
 		if err := lim.AcquireSlot(ctx); err != nil {
 			return // ctx 取消,停止认领
@@ -259,15 +329,66 @@ func (s *scheduler) claimLoop(ctx context.Context, queue string, lim QueueLimite
 			lim.ReleaseSlot()
 			return
 		}
+		// 周期配额(spec 006):硬配额,预留在认领前由介质原子完成。
+		var res *QuotaReservation
+		if qg != nil {
+			// 启发式:队列空就不预留,免得空轮询每圈白烧一份额度(有竞态,只是消常态)。
+			if n, qerr := s.gate.broker.QueueLen(ctx, queue); qerr == nil && n == 0 {
+				lim.ReleaseSlot()
+				if s.gate.clock.Sleep(ctx, quotaWait) != nil {
+					return
+				}
+				continue
+			}
+			r, err := qg.Reserve(ctx)
+			switch {
+			case err != nil:
+				// 介质不可达:fail-closed——零放行,退避重试,绝不退回进程内计数。
+				qs.stalled.Store(true)
+				lim.ReleaseSlot()
+				if ctx.Err() != nil {
+					return
+				}
+				if s.gate.clock.Sleep(ctx, quotaWait) != nil {
+					return
+				}
+				continue
+			case r == nil:
+				// 本窗口额度耗尽:不是错误,不占槽等待,退避后再试(下窗自动恢复)。
+				qs.exhausted.Store(true)
+				lim.ReleaseSlot()
+				if s.gate.clock.Sleep(ctx, quotaWait) != nil {
+					return
+				}
+				continue
+			}
+			qs.exhausted.Store(false)
+			qs.stalled.Store(false)
+			res = r
+		}
 		// 先拿令牌再 Dequeue:队列空闲期会预烧至多 1 个令牌等在 Dequeue 上,
 		// Dequeue 出错也白烧 1 个,这点偏差在 M1 spec SC-001 的 ±1 容差内。
-		t, err := s.gate.broker.Dequeue(ctx, []string{queue})
+		// 持有预留时给 Dequeue 加兜底超时(真时间):限定预留挂在手里的时长上界,
+		// 超时走尽力退还——启发式已把这条路压成罕见路径,行为语义不依赖它。
+		dctx := ctx
+		var dcancel context.CancelFunc
+		if res != nil {
+			dctx, dcancel = context.WithTimeout(ctx, quotaDequeueBound(time.Duration(qc.QuotaPeriod)))
+		}
+		t, err := s.gate.broker.Dequeue(dctx, []string{queue})
+		if dcancel != nil {
+			dcancel()
+		}
 		if err != nil {
+			if res != nil {
+				// 认领扑空/出错:尽力退还;退不掉当 leaked(方向保守),不重试。
+				_ = qg.Release(context.Background(), res)
+			}
 			lim.ReleaseSlot()
 			if ctx.Err() != nil {
 				return
 			}
-			// 后端抖了一下:冷却后重试,不能空转打爆它。
+			// 后端抖了一下(或兜底超时):冷却后重试,不能空转打爆它。
 			_ = s.gate.clock.Sleep(ctx, dequeueRetryWait)
 			continue
 		}

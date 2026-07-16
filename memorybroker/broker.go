@@ -38,8 +38,11 @@ type Broker struct {
 	// replayed 记哪些执行已被重放过(链不分叉的判据)。
 	chains   map[string][]string
 	replayed map[string]bool
-	inited   bool
-	closed   bool
+	// quota 周期配额计数(spec 006):qkey → 窗口起点(unix 秒)→ 已用次数。
+	// 介质就是本进程内存,注入的 Clock 即介质服务端钟。
+	quota  map[string]map[int64]int
+	inited bool
+	closed bool
 }
 
 // New 构造一个空的内存后端;用之前必须先 Init(由 taskgate.New(cfg) 统一调用)。
@@ -48,6 +51,7 @@ func New() *Broker {
 		recs:     make(map[string]*record),
 		chains:   make(map[string][]string),
 		replayed: make(map[string]bool),
+		quota:    make(map[string]map[int64]int),
 	}
 	b.cond = sync.NewCond(&b.mu)
 	return b
@@ -869,5 +873,71 @@ func (b *Broker) Close() error {
 	defer b.mu.Unlock()
 	b.closed = true
 	b.cond.Broadcast()
+	return nil
+}
+
+// ---- 周期配额(spec 006):QuotaProvider 能力实现 ----
+
+// QueueQuota 构造该队列的配额闸。介质是本进程内存,计数与任务共用同一把大锁。
+func (b *Broker) QueueQuota(queue string, qc taskgate.QueueConfig) (taskgate.QuotaGate, error) {
+	key := qc.QuotaKey
+	if key == "" {
+		key = queue
+	}
+	periodSec := int64(time.Duration(qc.QuotaPeriod) / time.Second)
+	if qc.QuotaLimit <= 0 || periodSec < 1 {
+		return nil, fmt.Errorf("memorybroker: invalid quota config for queue %q: limit=%d period=%v",
+			queue, qc.QuotaLimit, time.Duration(qc.QuotaPeriod))
+	}
+	return &memQuotaGate{b: b, key: key, limit: qc.QuotaLimit, periodSec: periodSec}, nil
+}
+
+// memQuotaGate 内存介质的配额闸,是 RunQuota 套件的语义参考实现。
+type memQuotaGate struct {
+	b         *Broker
+	key       string
+	limit     int
+	periodSec int64
+}
+
+// Reserve 单锁临界区内原子完成"取介质钟 → 算窗口 → 检查 → 扣减"。
+// 三态合同见 taskgate.QuotaGate。
+func (g *memQuotaGate) Reserve(ctx context.Context) (*taskgate.QuotaReservation, error) {
+	b := g.b
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.requireInit(); err != nil {
+		return nil, err
+	}
+	win := b.clk.Now().Unix() / g.periodSec * g.periodSec
+	wins := b.quota[g.key]
+	if wins == nil {
+		wins = make(map[int64]int)
+		b.quota[g.key] = wins
+	}
+	// 顺手清掉已作废的旧窗口(与正确性无关,只防堆积)。
+	for w := range wins {
+		if w < win-2*g.periodSec {
+			delete(wins, w)
+		}
+	}
+	if wins[win] >= g.limit {
+		return nil, nil // 本窗口耗尽:不是错误
+	}
+	wins[win]++
+	return &taskgate.QuotaReservation{Window: win}, nil
+}
+
+// Release 尽力退还:只退预留时的窗口,窗口已切走/已清理则落空无害。
+func (g *memQuotaGate) Release(ctx context.Context, r *taskgate.QuotaReservation) error {
+	if r == nil {
+		return nil
+	}
+	b := g.b
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if wins := b.quota[g.key]; wins != nil && wins[r.Window] > 0 {
+		wins[r.Window]--
+	}
 	return nil
 }

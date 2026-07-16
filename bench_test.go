@@ -200,3 +200,94 @@ func benchPipeline(b *testing.B, br taskgate.Broker) {
 
 func BenchmarkPipelineSqlite(b *testing.B) { benchPipeline(b, newBenchSqlite(b)) }
 func BenchmarkPipelineRedis(b *testing.B)  { benchPipeline(b, newBenchRedis(b)) }
+
+// ---- BenchmarkQuota(spec 006 FR-013):预留原子操作与认领链的配额损耗 ----
+
+// benchQuotaReserve 一个 op = 一次"检查+扣减"原子预留(额度给到永不耗尽),
+// 量的是同 key 热点(单行/单键)争用下预留本身的开销。
+func benchQuotaReserve(b *testing.B, br taskgate.Broker) {
+	newBenchGate(b, br)
+	qp, ok := br.(taskgate.QuotaProvider)
+	if !ok {
+		b.Fatalf("%T 不实现 QuotaProvider", br)
+	}
+	g, err := qp.QueueQuota(benchQueue, taskgate.QueueConfig{
+		Workers: 1, QuotaLimit: 1 << 30, QuotaPeriod: taskgate.Duration(time.Hour),
+	})
+	if err != nil {
+		b.Fatalf("QueueQuota 失败: %v", err)
+	}
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r, err := g.Reserve(ctx)
+		if err != nil || r == nil {
+			b.Fatalf("Reserve 失败: r=%v err=%v", r, err)
+		}
+	}
+}
+
+// benchQuotaReserveParallel 32 路并发争同一行/同一键(所有消费者争同一 quota key
+// 是配额的真实热点形状)。
+func benchQuotaReserveParallel(b *testing.B, br taskgate.Broker) {
+	newBenchGate(b, br)
+	qp := br.(taskgate.QuotaProvider)
+	g, err := qp.QueueQuota(benchQueue, taskgate.QueueConfig{
+		Workers: 1, QuotaLimit: 1 << 30, QuotaPeriod: taskgate.Duration(time.Hour),
+	})
+	if err != nil {
+		b.Fatalf("QueueQuota 失败: %v", err)
+	}
+	b.SetParallelism(32)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if r, err := g.Reserve(context.Background()); err != nil || r == nil {
+				b.Errorf("Reserve 失败: r=%v err=%v", r, err)
+				return
+			}
+		}
+	})
+}
+
+// benchDequeueAckQuota 与 benchDequeueAck 同形,但认领前多一次预留
+// (额度永不耗尽):两者对比就是"有配额 vs 无配额"的认领吞吐损耗(FR-013)。
+func benchDequeueAckQuota(b *testing.B, br taskgate.Broker) {
+	newBenchGate(b, br)
+	qp := br.(taskgate.QuotaProvider)
+	g, err := qp.QueueQuota(benchQueue, taskgate.QueueConfig{
+		Workers: 1, QuotaLimit: 1 << 30, QuotaPeriod: taskgate.Duration(time.Hour),
+	})
+	if err != nil {
+		b.Fatalf("QueueQuota 失败: %v", err)
+	}
+	ctx := context.Background()
+	payload := json.RawMessage(`{"n":1}`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		t := &taskgate.Task{Type: benchQueue, Queue: benchQueue, Payload: payload}
+		if err := br.Enqueue(ctx, t); err != nil {
+			b.Fatalf("Enqueue 失败: %v", err)
+		}
+		if r, err := g.Reserve(ctx); err != nil || r == nil {
+			b.Fatalf("Reserve 失败: r=%v err=%v", r, err)
+		}
+		got, err := br.Dequeue(ctx, []string{benchQueue})
+		if err != nil {
+			b.Fatalf("Dequeue 失败: %v", err)
+		}
+		if err := br.Ack(ctx, got.ID, got.LeaseToken, []byte(`"ok"`)); err != nil {
+			b.Fatalf("Ack 失败: %v", err)
+		}
+	}
+}
+
+func BenchmarkQuotaReserveSqlite(b *testing.B)     { benchQuotaReserve(b, newBenchSqlite(b)) }
+func BenchmarkQuotaReserveRedis(b *testing.B)      { benchQuotaReserve(b, newBenchRedis(b)) }
+func BenchmarkQuotaReserveSqlite32(b *testing.B)   { benchQuotaReserveParallel(b, newBenchSqlite(b)) }
+func BenchmarkQuotaReserveRedis32(b *testing.B)    { benchQuotaReserveParallel(b, newBenchRedis(b)) }
+func BenchmarkDequeueAckQuotaSqlite(b *testing.B)  { benchDequeueAckQuota(b, newBenchSqlite(b)) }
+func BenchmarkDequeueAckQuotaRedis(b *testing.B)   { benchDequeueAckQuota(b, newBenchRedis(b)) }

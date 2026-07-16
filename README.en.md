@@ -15,6 +15,7 @@ It is a **library, not a service** — there is no Web UI, it reads no environme
 ## Features
 
 - **Per-type rate limiting**: each queue has its own `{Workers, RPS, Burst}`, so a slow queue never drags down a fast one; `Routes` lets multiple task types share a queue (and thus share one gateway's quota).
+- **Periodic quota (hard quota)**: `{QuotaLimit, QuotaPeriod}` caps "at most N handler starts per fixed window" — rate and quota are different things (see below); the counter is shared across processes via the backend's medium and **never over-grants**: every failure mode only under-admits. A backend that can't share the counter makes `New()` fail — quota never degrades silently.
 - **Five backends, one contract**: `memorybroker` (in-memory, zero deps), `sqlitebroker` (single-file on disk, pure Go, no cgo), `redisbroker` (multi-process shared, atomic Lua transitions), `pgbroker` (PostgreSQL), `mysqlbroker` (MySQL) — the last two are server-database backends: multi-process shared, exclusive claim via `FOR UPDATE SKIP LOCKED` (requires MySQL 8.0+ / PostgreSQL 9.5+); all five pass the same behavioral contract (`brokertest`, 22 cases).
 - **Distributed rate limiting** (redis backend): a queue's Workers/RPS quota is shared across every process connected to the same Redis, so adding machines doesn't mean hammering the gateway; concurrency slots held by a crashed process are reclaimed by lease.
 - **Lease reclaim**: claiming a task takes a lease, heartbeats renew it automatically; after a worker crash the reaper picks tasks back up to rerun, and poison tasks hit a cap and go to the dead-letter state; long tasks can call `RenewLease` inside the handler, or turn off the auto heartbeat per queue and go fully manual (`ManualHeartbeat`). **The price is at-least-once — crash reclaim reruns your handler, so it must be idempotent**; see [The handler contract](#the-handler-contract-must-be-idempotent).
@@ -343,6 +344,9 @@ queues:
     rps: 3           # per-second admissions, 0 = no limit
     burst: 3         # burst allowance, 0 falls back to max(1, int(rps))
     lease_ttl: 60s   # lease duration, 0 fills in the default 60s
+    quota_limit: 5000   # periodic quota: at most 5000 handler starts per window, 0 = disabled
+    quota_period: 24h   # window length (>=1s; fixed windows aligned to epoch — 24h means UTC midnight, not your local calendar day)
+    quota_key: my-gw    # quota key, empty = queue name; queues sharing a key share one window budget
   cpu:
     workers: 4
 routes:              # task type → queue; unrouted types use the type name as the queue name
@@ -360,6 +364,20 @@ cfg.Broker = memorybroker.New()    // inject runtime objects by hand
 cfg.OnStateChange = func(t taskgate.Task) { /* instrument */ }
 g, err := taskgate.New(cfg)
 ```
+
+### Rate ≠ quota: the periodic hard quota
+
+`RPS` protects the gateway from bursts ("don't hammer it"); `QuotaLimit` protects your bill ("don't overspend the window budget") — **they are different things**: a gateway allowing 5,000 calls a day does not mean you must spread them one per 17 seconds; you may burn the budget at full speed and then stop. The three dimensions are orthogonal: `Workers` caps concurrency, `RPS` caps starts per second, `QuotaLimit` caps cumulative starts per window.
+
+The honest contract:
+
+- **Hard quota, never over-grants**: the window counter is decremented atomically in the shared medium (summed across every process on that medium); crashes, disconnects, and failed refunds all err on the side of admitting *less*, never more;
+- Windows are **fixed-length, aligned to epoch** (`24h` resets at UTC midnight) — not your local calendar day, not a calendar month, and not your gateway's billing cycle; window time comes from the medium's server clock, so application clock skew doesn't matter;
+- The unit is **handler starts**, not tasks (a retry's re-claim counts again) and not tokens;
+- Two consumption leaks to keep in mind: a handler that starts and then fails or gets canceled, and a task whose type has no registered handler (dead-lettered) — in both cases the quota **was already spent**;
+- Exhaustion is **not an error**: the queue stops claiming (without holding a worker slot), tasks sit in pending until the next window, nothing lands in `Throttled` or failed; `Stats(queue)` exposes a `QuotaExhausted` bit;
+- If the quota medium is unreachable the queue **fails closed**: claiming pauses, zero admissions, retried with backoff (`QuotaStalled` bit visible) — it never falls back to an in-process counter pretending you're still protected;
+- The backend must support shared counting (all five built-ins do: memory = the process, sqlite = the db file, redis/pg/mysql = the server); configuring quota on a backend that doesn't makes `New()` fail.
 
 ## Look and feel
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/AmbroseX/taskgate"
 	"github.com/AmbroseX/taskgate/brokertest"
+	"github.com/AmbroseX/taskgate/internal/fakeclock"
 	"github.com/AmbroseX/taskgate/redisbroker"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/oklog/ulid/v2"
@@ -147,4 +148,25 @@ func TestUseBeforeInit(t *testing.T) {
 	if _, err := b.Dequeue(ctx, []string{"q"}); err == nil {
 		t.Fatal("未 Init 调 Dequeue 应返回错误,实际 nil")
 	}
+}
+
+// TestQuotaCapability 周期配额能力套件(spec 006):miniredis 介质,
+// 介质时间用 SetTime 控制(脚本内 TIME 的回音),与 fakeclock 同步推进,不真 sleep。
+func TestQuotaCapability(t *testing.T) {
+	brokertest.RunQuota(t, func(t *testing.T, opts taskgate.BrokerOptions) (taskgate.Broker, func(time.Duration)) {
+		mr := miniredis.RunT(t)
+		b, err := redisbroker.New(redisbroker.Options{Addr: mr.Addr()})
+		if err != nil {
+			t.Fatalf("redisbroker New 失败: %v", err)
+		}
+		if err := b.Init(opts); err != nil {
+			t.Fatalf("redisbroker Init 失败: %v", err)
+		}
+		clk := opts.Clock.(*fakeclock.Clock)
+		mr.SetTime(clk.Now())
+		return b, func(d time.Duration) {
+			clk.Advance(d)
+			mr.SetTime(clk.Now())
+		}
+	})
 }

@@ -586,3 +586,54 @@ func TestE2ECronReplay(t *testing.T) {
 		t.Fatalf("链字段不对: E2.ReplayOf=%q E1.Status=%s", hist[1].ReplayOf, hist[0].Status)
 	}
 }
+
+// TestE2EQuotaCombined(spec 006 SC-005)三维度正交:{Workers:2, RPS:8, Quota:10/2s}
+// 打 mockgw——并发不超 2(网关观测)、窗口累计不超 10(第 11 个在下窗才跑)。
+func TestE2EQuotaCombined(t *testing.T) {
+	const (
+		period = 2 * time.Second
+		limit  = 10
+		total  = 15
+	)
+	ctx := context.Background()
+	gw := mockgw.New(mockgw.Latency(5 * time.Millisecond))
+	defer gw.Close()
+	g := newGate(t, taskgate.Config{
+		Queues: map[string]taskgate.QueueConfig{
+			"llm": {Workers: 2, RPS: 8, QuotaLimit: limit, QuotaPeriod: taskgate.Duration(period)},
+		},
+	})
+	g.Handle("llm", gatewayHandler(gw.URL(), nil))
+
+	// 对齐窗口边界再开闸,让"每窗 ≤10"的断言不被边界横插。
+	now := time.Now()
+	time.Sleep(time.Until(now.Truncate(period).Add(period)) + 100*time.Millisecond)
+	windowEnd := time.Now().Truncate(period).Add(period)
+
+	for i := 0; i < total; i++ {
+		if _, err := g.Submit(ctx, "llm", json.RawMessage(fmt.Sprintf(`{"i":%d}`, i))); err != nil {
+			t.Fatalf("Submit 失败: %v", err)
+		}
+	}
+	startGate(t, g)
+
+	// 窗口 1 结束前:恰好 limit 个完成(RPS=8、latency 5ms,10 个在 ~1.3s 内跑完)。
+	waitFor(t, time.Until(windowEnd)-200*time.Millisecond, func() bool {
+		return statusCount(t, g, "llm", taskgate.StatusCompleted) == limit
+	}, "窗口 1 应恰好放行 limit 个")
+	time.Sleep(time.Until(windowEnd) - 50*time.Millisecond)
+	if n := statusCount(t, g, "llm", taskgate.StatusCompleted); n != limit {
+		t.Fatalf("窗口 1 内累计完成应恰好 %d,实际 %d(第 %d 个必须等下窗)", limit, n, limit+1)
+	}
+
+	// 窗口 2:剩余 5 个跑完;Workers 维度全程成立。
+	waitFor(t, period+2*time.Second, func() bool {
+		return statusCount(t, g, "llm", taskgate.StatusCompleted) == total
+	}, "窗口 2 应跑完剩余任务")
+	if got := gw.MaxConcurrency(); got > 2 {
+		t.Fatalf("Workers=2 维度被打破:网关观测最大并发 %d", got)
+	}
+	if n := statusCount(t, g, "llm", taskgate.StatusFailed); n != 0 {
+		t.Fatalf("配额路径不得产生 failed,实际 %d", n)
+	}
+}

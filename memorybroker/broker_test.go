@@ -7,6 +7,7 @@ import (
 
 	"github.com/AmbroseX/taskgate"
 	"github.com/AmbroseX/taskgate/brokertest"
+	"github.com/AmbroseX/taskgate/internal/fakeclock"
 	"github.com/AmbroseX/taskgate/memorybroker"
 )
 
@@ -42,4 +43,16 @@ func TestUseBeforeInit(t *testing.T) {
 	if _, err := b.ReapExpired(ctx); err == nil {
 		t.Fatal("未 Init 调 ReapExpired 应返回错误,实际 nil")
 	}
+}
+
+// TestQuotaCapability 周期配额能力套件(spec 006):内存介质,注入 fakeclock 即介质钟。
+func TestQuotaCapability(t *testing.T) {
+	brokertest.RunQuota(t, func(t *testing.T, opts taskgate.BrokerOptions) (taskgate.Broker, func(time.Duration)) {
+		b := memorybroker.New()
+		if err := b.Init(opts); err != nil {
+			t.Fatalf("Init 失败: %v", err)
+		}
+		clk := opts.Clock.(*fakeclock.Clock)
+		return b, clk.Advance
+	})
 }

@@ -79,6 +79,13 @@ func (mysqlDialect) SchemaSQL(prefix string) []string {
 		"ALTER TABLE " + tasks + " ADD UNIQUE KEY " + prefix + "uq_chain_head (chain_head_key)",
 		"ALTER TABLE " + tasks + " ADD UNIQUE KEY " + prefix + "uq_replay_of (replay_of_uq)",
 		"ALTER TABLE " + tasks + " ADD KEY " + prefix + "idx_business_key (business_key)",
+		// 周期配额(spec 006):qkey + 窗口起点 → 已用次数;扣减靠单条 ODKU 原子完成。
+		"CREATE TABLE IF NOT EXISTS " + prefix + "quota (" +
+			"qkey VARCHAR(255) NOT NULL," +
+			"win  BIGINT NOT NULL," +
+			"used BIGINT NOT NULL," +
+			"PRIMARY KEY (qkey, win)" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 		"CREATE TABLE IF NOT EXISTS " + deps + " (" +
 			"child_id  VARCHAR(255) NOT NULL," +
 			"parent_id VARCHAR(255) NOT NULL," +
@@ -110,6 +117,18 @@ func (mysqlDialect) DuplicateKeyConstraint(err error) string {
 func (mysqlDialect) IsIdempotentDDLErr(err error) bool {
 	var myErr *mysql.MySQLError
 	return errors.As(err, &myErr) && (myErr.Number == 1060 || myErr.Number == 1061)
+}
+
+// QuotaSQL MySQL 没有 RETURNING,走两步路径:先 Now 取服务端时间(NULL 覆盖 = UNIX_TIMESTAMP),
+// Go 侧算窗口,再单条 ODKU 原子扣减——affected 1(插入)/2(真更新)成功、0(没变)耗尽
+// (go-sql-driver 默认不带 CLIENT_FOUND_ROWS,affected 数的是"真变更"行)。
+func (mysqlDialect) QuotaSQL(prefix string) sqlbroker.QuotaSQL {
+	q := prefix + "quota"
+	return sqlbroker.QuotaSQL{
+		Now: "SELECT COALESCE(?, UNIX_TIMESTAMP())",
+		Upsert: "INSERT INTO " + q + " (qkey, win, used) VALUES (?, ?, 1) " +
+			"ON DUPLICATE KEY UPDATE used = IF(used < ?, used + 1, used)",
+	}
 }
 
 // Retryable MySQL 死锁 1213 立即返回、可立即重试;锁等待超时 1205 默认要等

@@ -45,9 +45,16 @@ var (
 	luaReap string
 	//go:embed lua/replay.lua
 	luaReplay string
+	//go:embed lua/quota_reserve.lua
+	luaQuotaReserve string
+	//go:embed lua/quota_release.lua
+	luaQuotaRelease string
 
-	scriptEnqueue   = redis.NewScript(luaCommon + "\n" + luaEnqueue)
-	scriptReplay    = redis.NewScript(luaCommon + "\n" + luaReplay)
+	scriptEnqueue = redis.NewScript(luaCommon + "\n" + luaEnqueue)
+	scriptReplay  = redis.NewScript(luaCommon + "\n" + luaReplay)
+	// 配额脚本不拼 common.lua:不碰任务键、不走状态机;TIME 豁免见脚本头注释。
+	scriptQuotaReserve = redis.NewScript(luaQuotaReserve)
+	scriptQuotaRelease = redis.NewScript(luaQuotaRelease)
 	scriptClaim     = redis.NewScript(luaCommon + "\n" + luaClaim)
 	scriptFinish    = redis.NewScript(luaCommon + "\n" + luaFinish)
 	scriptHeartbeat = redis.NewScript(luaCommon + "\n" + luaHeartbeat)

@@ -133,6 +133,17 @@ type QueueConfig struct {
 	// (返回 ErrTaskCanceled);handler 一直不续租,则由租约过期兜底回收。
 	// 本地 Cancel(同进程)不受影响,依然即时打断 handler 的 ctx。
 	ManualHeartbeat bool `yaml:"manual_heartbeat" json:"manual_heartbeat"`
+
+	// 周期配额(spec 006,硬配额):每个固定时长窗口最多启动 QuotaLimit 次 handler。
+	// 窗口对齐 epoch(windowStart = now/period×period),时间取共享介质的服务端钟,
+	// 不是自然日/自然月;单位是"handler 启动次数",不是任务数(重试的再认领同样计数)。
+	// QuotaLimit=0 完全不启用(零开销);启用时 QuotaPeriod 必须 >0,且后端必须实现
+	// QuotaProvider 能力接口,否则 New() 直接报错——配额没有静默降级。
+	QuotaLimit  int      `yaml:"quota_limit" json:"quota_limit"`
+	QuotaPeriod Duration `yaml:"quota_period" json:"quota_period"`
+	// QuotaKey 配额键,空 = 队列名。多个队列配同一个 key 时共享同一份窗口预算
+	// (打同一个网关额度的场景),此时各队列的 (QuotaLimit, QuotaPeriod) 必须一致。
+	QuotaKey string `yaml:"quota_key" json:"quota_key"`
 }
 
 // 零值补默认的取值,来自 data-model.md。
@@ -158,6 +169,17 @@ func validateQueue(name string, q QueueConfig) (QueueConfig, error) {
 	}
 	if q.LeaseTTL == 0 {
 		q.LeaseTTL = defaultLeaseTTL
+	}
+	if q.QuotaLimit < 0 {
+		return q, fmt.Errorf("taskgate: queue %q: quota_limit must be >= 0, got %d", name, q.QuotaLimit)
+	}
+	if q.QuotaPeriod < 0 {
+		return q, fmt.Errorf("taskgate: queue %q: quota_period must be >= 0, got %v", name, time.Duration(q.QuotaPeriod))
+	}
+	if q.QuotaLimit > 0 && q.QuotaPeriod < Duration(time.Second) {
+		// 窗口起点按 unix 秒对齐(介质服务端时间的通用粒度),period 最小 1s。
+		return q, fmt.Errorf("taskgate: queue %q: quota_limit=%d requires quota_period >= 1s, got %v",
+			name, q.QuotaLimit, time.Duration(q.QuotaPeriod))
 	}
 	return q, nil
 }
@@ -194,6 +216,38 @@ func (c *Config) validate() error {
 			return err
 		}
 		c.DefaultQueue = fixed
+	}
+	// 规则 5(spec 006):同一 quota key 的窗口参数跨队列必须一致,否则共享预算说不清。
+	// key 为空取队列名(天然不冲突);DefaultQueue 的 key 在运行期才知道兜底给谁,
+	// 只有显式设置 QuotaKey 时才参与一致性检查。
+	type quotaCfg struct {
+		queue  string
+		limit  int
+		period Duration
+	}
+	quotaKeys := make(map[string]quotaCfg)
+	checkQuotaKey := func(queue, key string, q QueueConfig) error {
+		if q.QuotaLimit <= 0 || key == "" {
+			return nil
+		}
+		if prev, ok := quotaKeys[key]; ok && (prev.limit != q.QuotaLimit || prev.period != q.QuotaPeriod) {
+			return fmt.Errorf("taskgate: quota key %q: queue %q (limit=%d period=%v) conflicts with queue %q (limit=%d period=%v); shared key requires identical quota params",
+				key, queue, q.QuotaLimit, time.Duration(q.QuotaPeriod), prev.queue, prev.limit, time.Duration(prev.period))
+		}
+		quotaKeys[key] = quotaCfg{queue: queue, limit: q.QuotaLimit, period: q.QuotaPeriod}
+		return nil
+	}
+	for name, q := range c.Queues {
+		key := q.QuotaKey
+		if key == "" {
+			key = name
+		}
+		if err := checkQuotaKey(name, key, q); err != nil {
+			return err
+		}
+	}
+	if err := checkQuotaKey("(default)", c.DefaultQueue.QuotaKey, c.DefaultQueue); err != nil {
+		return err
 	}
 	// 规则 4:两个封顶计数不能为负,零值补默认。
 	if c.LeaseLostMax < 0 {

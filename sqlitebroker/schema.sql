@@ -39,6 +39,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_replay_of
     ON tasks(replay_of) WHERE replay_of <> '';
 -- 按键查询(Filter.BusinessKey / History)。
 CREATE INDEX IF NOT EXISTS idx_business_key ON tasks(business_key) WHERE business_key <> '';
+-- 周期配额(spec 006):qkey + 窗口起点(unix 秒,对齐 period)→ 已用次数。
+-- "检查 + 扣减"由单条 INSERT ... ON CONFLICT 原子完成,窗口时间用 sqlite 自己的钟
+-- (共享介质是本机文件,本机钟就是介质的服务端钟)。
+CREATE TABLE IF NOT EXISTS quota (
+    qkey TEXT    NOT NULL,
+    win  INTEGER NOT NULL,
+    used INTEGER NOT NULL,
+    PRIMARY KEY (qkey, win)
+);
 CREATE TABLE IF NOT EXISTS task_deps (
     child_id  TEXT NOT NULL,
     parent_id TEXT NOT NULL,

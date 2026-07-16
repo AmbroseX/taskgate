@@ -10,3 +10,10 @@ package sqlitebroker
 func SetTestHookBeforeAckCommit(fn func()) {
 	testHookBeforeAckCommit = fn
 }
+
+// SetTestQuotaNow 设置周期配额的介质时间覆盖(spec 006,unix 秒),传 nil 恢复
+// "用 sqlite 自己的钟"。RunQuota 套件用它把介质时间挂到 fakeclock 上,测试不真 sleep。
+// 注意:非并发安全,只应在跑用例前的单线程阶段设置。
+func SetTestQuotaNow(fn func() int64) {
+	testQuotaNow = fn
+}

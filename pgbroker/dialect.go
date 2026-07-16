@@ -87,6 +87,13 @@ func (pgDialect) SchemaSQL(prefix string) []string {
 			` (replay_of) WHERE replay_of <> ''`,
 		`CREATE INDEX IF NOT EXISTS ` + prefix + `idx_business_key ON ` + tasks +
 			` (business_key) WHERE business_key <> ''`,
+		// 周期配额(spec 006):qkey + 窗口起点 → 已用次数,"检查+扣减"单语句原子完成。
+		`CREATE TABLE IF NOT EXISTS ` + prefix + `quota (
+			qkey TEXT   NOT NULL,
+			win  BIGINT NOT NULL,
+			used BIGINT NOT NULL,
+			PRIMARY KEY (qkey, win)
+		)`,
 		`CREATE TABLE IF NOT EXISTS ` + deps + ` (
 			child_id  TEXT NOT NULL,
 			parent_id TEXT NOT NULL,
@@ -114,6 +121,19 @@ func (pgDialect) DuplicateKeyConstraint(err error) string {
 
 // IsIdempotentDDLErr PG 的 DDL 全部用 IF NOT EXISTS 表达,不存在良性重复错误。
 func (pgDialect) IsIdempotentDDLErr(error) bool { return false }
+
+// QuotaSQL PG 走单语句路径:ON CONFLICT..DO UPDATE..WHERE + RETURNING 一条原子完成
+// "取服务端时间 → 算窗口 → 检查余额 → 扣减";时间覆盖参数为 NULL 时用 now()(服务端钟)。
+func (pgDialect) QuotaSQL(prefix string) sqlbroker.QuotaSQL {
+	q := prefix + "quota"
+	return sqlbroker.QuotaSQL{
+		Reserve: `INSERT INTO ` + q + ` (qkey, win, used)
+			VALUES (?, COALESCE(CAST(? AS BIGINT), CAST(EXTRACT(EPOCH FROM now()) AS BIGINT)) / ? * ?, 1)
+			ON CONFLICT (qkey, win) DO UPDATE SET used = ` + q + `.used + 1 WHERE ` + q + `.used < ?
+			RETURNING win`,
+		Now: `SELECT COALESCE(CAST(? AS BIGINT), CAST(EXTRACT(EPOCH FROM now()) AS BIGINT))`,
+	}
+}
 
 // Retryable PG 死锁 40P01 / 序列化失败 40001 都是数据库立即返回,可立即重试。
 func (pgDialect) Retryable(err error) sqlbroker.RetryClass {

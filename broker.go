@@ -66,6 +66,40 @@ type LimiterProvider interface {
 	QueueLimiter(queue string, qc QueueConfig) (QueueLimiter, error)
 }
 
+// QuotaProvider 后端的**可选能力接口**(spec 006):能为队列提供跨进程共享的周期配额。
+// 与 LimiterProvider 平行,但合同相反——**没有静默降级**:配置了 QuotaLimit>0 而后端
+// 未实现本接口,taskgate.New() 直接报错。硬配额的全部意义是"绝不超发",退回进程内
+// 计数等于假保护,宁可不启动(模型裁决 #3)。
+//
+// 实现约束:构造必须廉价、不持有需显式释放的资源(同 LimiterProvider);
+// quota key 相同的多个 QuotaGate 共享介质计数,实例之间不得有本地共享状态。
+type QuotaProvider interface {
+	// QueueQuota 按队列配置构造配额闸;只在 qc.QuotaLimit > 0 时被调用。
+	QueueQuota(queue string, qc QueueConfig) (QuotaGate, error)
+}
+
+// QuotaGate 单个队列(quota key)的配额闸。行为合同见
+// specs/006-periodic-quota/contracts/quota-capability-contract.md。
+type QuotaGate interface {
+	// Reserve 原子预留一份额度:在共享介质内一个原子单位完成
+	// "取服务端时间 → 算窗口 → 检查余额 → 扣减",检查与扣减之间没有窗口。
+	// 返回三态:
+	//   - res≠nil:预留成功,res.Window 是本次预留落在的窗口起点;
+	//   - res==nil 且 err==nil:本窗口额度耗尽(**不是错误**,等下个窗口);
+	//   - err≠nil:介质故障,调用方必须 fail-closed(零放行,退避重试)。
+	Reserve(ctx context.Context) (*QuotaReservation, error)
+	// Release 尽力退还一份预留(认领扑空/出错的补偿),只作用于 r 的窗口;
+	// 窗口已切走则落空无害。失败时调用方不重试——该份额度当 leaked(视同消耗),
+	// 方向永远保守:任何故障只少放行、不多放行。
+	Release(ctx context.Context, r *QuotaReservation) error
+}
+
+// QuotaReservation 一次额度预留。Window 是预留落在的窗口起点
+// (unix 秒,共享介质的服务端钟),Release 靠它定位退还目标。
+type QuotaReservation struct {
+	Window int64
+}
+
 // Filter List 的过滤条件,零值字段表示不过滤。
 //
 // 排序与分页合同(M3 定型,三后端一致,见 contracts/broker-contract.md):

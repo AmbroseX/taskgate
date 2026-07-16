@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/brokertest"
+	"github.com/AmbroseX/taskgate/internal/fakeclock"
 	"github.com/AmbroseX/taskgate/internal/sqlbroker"
 	"github.com/AmbroseX/taskgate/mysqlbroker"
 	"github.com/AmbroseX/taskgate/pgbroker"
@@ -70,10 +72,60 @@ func dropSQLTables(t *testing.T, driver, dsn, prefix string) {
 	defer db.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	for _, tbl := range []string{prefix + "task_deps", prefix + "tasks"} {
+	for _, tbl := range []string{prefix + "task_deps", prefix + "tasks", prefix + "quota"} {
 		if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS `+tbl); err != nil {
 			t.Logf("清理 %s 失败(不影响断言): %v", tbl, err)
 		}
+	}
+}
+
+// TestQuotaCapabilitySQL 周期配额能力套件(spec 006)的 PG/MySQL 门控档:
+// 介质时间经 sqlbroker.SetTestQuotaNow 挂到 fakeclock(COALESCE 覆盖参数),不真 sleep;
+// 生产路径(NULL → 数据库服务端钟)由真机冒烟与多进程原型覆盖。
+func TestQuotaCapabilitySQL(t *testing.T) {
+	type entry struct {
+		name string
+		open func(t *testing.T) taskgate.Broker
+	}
+	var entries []entry
+	if dsn := os.Getenv("TASKGATE_PG_DSN"); dsn != "" {
+		entries = append(entries, entry{"postgres", func(t *testing.T) taskgate.Broker {
+			prefix := randPrefix()
+			b, err := pgbroker.Open(dsn, pgbroker.WithTablePrefix(prefix))
+			if err != nil {
+				t.Fatalf("打开 postgres 后端失败: %v", err)
+			}
+			t.Cleanup(func() { dropSQLTables(t, "pgx", dsn, prefix) })
+			return b
+		}})
+	}
+	if dsn := os.Getenv("TASKGATE_MYSQL_DSN"); dsn != "" {
+		entries = append(entries, entry{"mysql", func(t *testing.T) taskgate.Broker {
+			prefix := randPrefix()
+			b, err := mysqlbroker.Open(dsn, mysqlbroker.WithTablePrefix(prefix))
+			if err != nil {
+				t.Fatalf("打开 mysql 后端失败: %v", err)
+			}
+			t.Cleanup(func() { dropSQLTables(t, "mysql", dsn, prefix) })
+			return b
+		}})
+	}
+	if len(entries) == 0 {
+		t.Skip("未设置 TASKGATE_PG_DSN / TASKGATE_MYSQL_DSN,跳过 SQL 后端配额档")
+	}
+	for _, e := range entries {
+		t.Run(e.name, func(t *testing.T) {
+			brokertest.RunQuota(t, func(t *testing.T, opts taskgate.BrokerOptions) (taskgate.Broker, func(time.Duration)) {
+				b := e.open(t)
+				if err := b.Init(opts); err != nil {
+					t.Fatalf("Init 失败: %v", err)
+				}
+				clk := opts.Clock.(*fakeclock.Clock)
+				sqlbroker.SetTestQuotaNow(func() int64 { return clk.Now().Unix() })
+				t.Cleanup(func() { sqlbroker.SetTestQuotaNow(nil) })
+				return b, clk.Advance
+			})
+		})
 	}
 }
 

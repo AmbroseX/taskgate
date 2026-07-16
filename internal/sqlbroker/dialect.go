@@ -22,6 +22,21 @@ const (
 	RetryLimited
 )
 
+// QuotaSQL 周期配额的方言语句包(spec 006):
+//   - Reserve 非空 = 单语句路径(PG):一条原子语句完成"取服务端时间 → 算窗口 →
+//     检查余额 → 扣减 → RETURNING win";参数 (qkey, 时间覆盖, period, period, limit),
+//     零行 = 耗尽;
+//   - Reserve 为空 = 两步路径(MySQL 无 RETURNING):先 Now 取服务端时间(参数:时间覆盖,
+//     NULL = 服务端钟),Go 侧算窗口,再 Upsert 原子扣减(参数 qkey, win, limit),
+//     按 affected rows 判定(1=插入 2=真更新 → 成功;0=没变 → 耗尽)。
+//     取时与扣减分两步不破坏硬配额:原子性在 Upsert 上,时间只决定窗口归属,
+//     边界竞态最多把预留记进上一窗(仍是合法窗口,不会多放)。
+type QuotaSQL struct {
+	Reserve string
+	Now     string
+	Upsert  string
+}
+
 // Dialect 收口 PostgreSQL 与 MySQL 两库"真正不同"的点,其余标准 SQL 全在共享核心一份。
 // 实现放在各自薄壳包(pgbroker/mysqlbroker),因为要断言驱动私有错误类型
 // (*pgconn.PgError / *mysql.MySQLError),核心包 internal/sqlbroker 因此零驱动依赖。
@@ -59,6 +74,10 @@ type Dialect interface {
 
 	// Retryable 判定事务错误的重试档位(见 RetryClass)。同样 errors.As 禁字符串匹配。
 	Retryable(err error) RetryClass
+
+	// QuotaSQL 周期配额(spec 006)两库"真正不同"的三条语句;表名按 prefix 拼好、
+	// 占位符用 ?(核心过 Rebind)。Release/清理语句两库同形,不在本方法(见 quota.go)。
+	QuotaSQL(prefix string) QuotaSQL
 
 	// Lock 建表期库级互斥:多进程首启并发跑 DDL,PG 会报 tuple concurrently updated 等脏错。
 	// 锁必须钉在传入的独占连接 conn 上(MySQL GET_LOCK 是会话级,连接池会错位)。

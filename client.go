@@ -66,6 +66,22 @@ func newGate(cfg Config, clk Clock) (*Gate, error) {
 		Notify:          cfg.OnStateChange,
 		Clock:           clk,
 	}
+	// 周期配额没有静默降级(spec 006):任一队列启用配额而后端不支持共享计数,
+	// 这里直接拒绝启动——退回进程内计数等于假保护,比不提供更坏。
+	if _, ok := cfg.Broker.(QuotaProvider); !ok {
+		for name, q := range cfg.Queues {
+			if q.QuotaLimit > 0 {
+				return nil, fmt.Errorf(
+					"taskgate: queue %q: quota_limit=%d but broker %T does not implement QuotaProvider (quota never degrades silently)",
+					name, q.QuotaLimit, cfg.Broker)
+			}
+		}
+		if cfg.DefaultQueue.QuotaLimit > 0 {
+			return nil, fmt.Errorf(
+				"taskgate: default_queue: quota_limit=%d but broker %T does not implement QuotaProvider (quota never degrades silently)",
+				cfg.DefaultQueue.QuotaLimit, cfg.Broker)
+		}
+	}
 	if err := cfg.Broker.Init(opts); err != nil {
 		return nil, fmt.Errorf("taskgate: broker init: %w", err)
 	}
@@ -210,12 +226,15 @@ func (g *Gate) List(ctx context.Context, f Filter) ([]*Task, error) {
 	return g.broker.List(ctx, f)
 }
 
-// QueueStats 单个队列的水位:配置的并发/限速 + 当前在跑数 + 积压长度。
+// QueueStats 单个队列的水位:配置的并发/限速 + 当前在跑数 + 积压长度 + 配额状态位。
 type QueueStats struct {
 	Workers  int     `json:"workers"`   // 配置的并发上限
 	Running  int     `json:"running"`   // 本进程正在执行的任务数(纯生产者恒为 0)
 	QueueLen int     `json:"queue_len"` // 积压:pending + retrying
 	RPS      float64 `json:"rps"`       // 配置的限速,0 = 不限
+	// 周期配额状态位(spec 006):"队列不动了"必须能靠这两个位区分原因。
+	QuotaExhausted bool `json:"quota_exhausted"` // 本窗口额度已尽,认领暂停等下窗
+	QuotaStalled   bool `json:"quota_stalled"`   // 配额介质不可达,fail-closed 暂停中
 }
 
 // Stats 查单个队列的水位。队列没配置且没有 DefaultQueue 兜底时报错。
@@ -231,11 +250,14 @@ func (g *Gate) Stats(ctx context.Context, queue string) (QueueStats, error) {
 	if err != nil {
 		return QueueStats{}, err
 	}
+	exhausted, stalled := g.sched.quotaStateFor(queue)
 	return QueueStats{
-		Workers:  qc.Workers,
-		Running:  g.sched.runningCount(queue),
-		QueueLen: n,
-		RPS:      qc.RPS,
+		Workers:        qc.Workers,
+		Running:        g.sched.runningCount(queue),
+		QueueLen:       n,
+		RPS:            qc.RPS,
+		QuotaExhausted: exhausted,
+		QuotaStalled:   stalled,
 	}, nil
 }
 
