@@ -28,11 +28,11 @@ type record struct {
 
 // Broker 内存后端。所有读写都拿同一把锁,Cond 用来唤醒阻塞中的 Dequeue。
 type Broker struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	opts   taskgate.BrokerOptions
-	clk    taskgate.Clock
-	recs   map[string]*record
+	mu   sync.Mutex
+	cond *sync.Cond
+	opts taskgate.BrokerOptions
+	clk  taskgate.Clock
+	recs map[string]*record
 	// Identity 身份模型(spec 005)的链索引,与 recs 同锁维护:
 	// chains 记每个 BusinessKey 下的执行历史链(创建序,链尾即最新);
 	// replayed 记哪些执行已被重放过(链不分叉的判据)。

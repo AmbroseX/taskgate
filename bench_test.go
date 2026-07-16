@@ -285,9 +285,9 @@ func benchDequeueAckQuota(b *testing.B, br taskgate.Broker) {
 	}
 }
 
-func BenchmarkQuotaReserveSqlite(b *testing.B)     { benchQuotaReserve(b, newBenchSqlite(b)) }
-func BenchmarkQuotaReserveRedis(b *testing.B)      { benchQuotaReserve(b, newBenchRedis(b)) }
-func BenchmarkQuotaReserveSqlite32(b *testing.B)   { benchQuotaReserveParallel(b, newBenchSqlite(b)) }
-func BenchmarkQuotaReserveRedis32(b *testing.B)    { benchQuotaReserveParallel(b, newBenchRedis(b)) }
-func BenchmarkDequeueAckQuotaSqlite(b *testing.B)  { benchDequeueAckQuota(b, newBenchSqlite(b)) }
-func BenchmarkDequeueAckQuotaRedis(b *testing.B)   { benchDequeueAckQuota(b, newBenchRedis(b)) }
+func BenchmarkQuotaReserveSqlite(b *testing.B)    { benchQuotaReserve(b, newBenchSqlite(b)) }
+func BenchmarkQuotaReserveRedis(b *testing.B)     { benchQuotaReserve(b, newBenchRedis(b)) }
+func BenchmarkQuotaReserveSqlite32(b *testing.B)  { benchQuotaReserveParallel(b, newBenchSqlite(b)) }
+func BenchmarkQuotaReserveRedis32(b *testing.B)   { benchQuotaReserveParallel(b, newBenchRedis(b)) }
+func BenchmarkDequeueAckQuotaSqlite(b *testing.B) { benchDequeueAckQuota(b, newBenchSqlite(b)) }
+func BenchmarkDequeueAckQuotaRedis(b *testing.B)  { benchDequeueAckQuota(b, newBenchRedis(b)) }

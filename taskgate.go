@@ -68,9 +68,9 @@ type Task struct {
 	ID              string              `json:"id"`                     // ExecutionID:一次执行的永久身份,broker 生成 ulid,永不复用;公开 API 不提供写入口
 	BusinessKey     string              `json:"business_key,omitempty"` // 业务幂等键:同键下存在任何执行则 Enqueue 拒绝;创建后不可变
 	ReplayOf        string              `json:"replay_of,omitempty"`    // 本执行重放自哪个 ExecutionID;由 Replay 写入,创建后不可变
-	Type            string              `json:"type"`              // 决定 handler 和默认队列
-	Queue           string              `json:"queue"`             // 限流单元,入队那一刻定死
-	Payload         json.RawMessage     `json:"payload,omitempty"` // 入参
+	Type            string              `json:"type"`                   // 决定 handler 和默认队列
+	Queue           string              `json:"queue"`                  // 限流单元,入队那一刻定死
+	Payload         json.RawMessage     `json:"payload,omitempty"`      // 入参
 	Status          Status              `json:"status"`
 	Result          json.RawMessage     `json:"result,omitempty"` // Ack 时写入
 	LastError       string              `json:"last_error,omitempty"`
@@ -331,7 +331,7 @@ func applySubmitOptions(opts ...SubmitOption) submitOptions {
 // replayOptions 收集重放选项,由 Gate.Replay / Gate.ReplayByKey 消费。
 type replayOptions struct {
 	allowCompleted bool
-	payload         json.RawMessage // nil = 复制目标执行的 Payload
+	payload        json.RawMessage // nil = 复制目标执行的 Payload
 }
 
 // ReplayOption 重放时的函数式选项。

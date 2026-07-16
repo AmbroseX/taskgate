@@ -55,10 +55,10 @@ var (
 	// 配额脚本不拼 common.lua:不碰任务键、不走状态机;TIME 豁免见脚本头注释。
 	scriptQuotaReserve = redis.NewScript(luaQuotaReserve)
 	scriptQuotaRelease = redis.NewScript(luaQuotaRelease)
-	scriptClaim     = redis.NewScript(luaCommon + "\n" + luaClaim)
-	scriptFinish    = redis.NewScript(luaCommon + "\n" + luaFinish)
-	scriptHeartbeat = redis.NewScript(luaCommon + "\n" + luaHeartbeat)
-	scriptReap      = redis.NewScript(luaCommon + "\n" + luaReap)
+	scriptClaim        = redis.NewScript(luaCommon + "\n" + luaClaim)
+	scriptFinish       = redis.NewScript(luaCommon + "\n" + luaFinish)
+	scriptHeartbeat    = redis.NewScript(luaCommon + "\n" + luaHeartbeat)
+	scriptReap         = redis.NewScript(luaCommon + "\n" + luaReap)
 )
 
 // pollInterval Dequeue 无果时的兜底轮询间隔:同进程写入靠内部唤醒信号即时响应,
