@@ -1,0 +1,57 @@
+package sqlbroker
+
+import (
+	"context"
+	"database/sql"
+)
+
+// RetryClass 事务错误的重试判定,三态。sqlite 单连接串行不会死锁,所以蓝本里没有重试;
+// PG/MySQL 是真并发行锁,多行事务(尤其连锁传播按树形状加锁)必然有死锁窗口,
+// withTx 靠 Dialect.Retryable 判定后自动重跑整个事务(见 broker.go 的重试环)。
+type RetryClass int
+
+const (
+	// NotRetryable 不可重试:业务错误、约束冲突等,原样返回给调用方。
+	NotRetryable RetryClass = iota
+	// RetryImmediate 立即可重试:数据库单方面 kill 的死锁/序列化失败(PG 40P01/40001、MySQL 1213),
+	// 事务几乎瞬间返回,重试便宜,按指数退避重试到上限。
+	RetryImmediate
+	// RetryLimited 有限重试:MySQL 1205 锁等待超时——默认要等 innodb_lock_wait_timeout 才报,
+	// 不能和死锁同等指数重试(单次调用最坏挂死几百秒),只重试一次、短退避。
+	// mysqlbroker 同时会把会话级 innodb_lock_wait_timeout 调低配合。
+	RetryLimited
+)
+
+// Dialect 收口 PostgreSQL 与 MySQL 两库"真正不同"的点,其余标准 SQL 全在共享核心一份。
+// 实现放在各自薄壳包(pgbroker/mysqlbroker),因为要断言驱动私有错误类型
+// (*pgconn.PgError / *mysql.MySQLError),核心包 internal/sqlbroker 因此零驱动依赖。
+//
+// 认领(claim)与收割(reap)不在本接口:它们统一用
+// "SELECT ... FOR UPDATE SKIP LOCKED 拿行 → 逐行 UPDATE" 完成,这个语法两库完全一致,
+// 不需要 UPDATE...RETURNING(PG 有 MySQL 无),核心一份代码即可。
+type Dialect interface {
+	// Name 方言名 "postgres" / "mysql",日志与错误前缀用。
+	Name() string
+
+	// Rebind 只改 SQL 文本、不碰 args 切片:PG 把第 n 个 ? 换成 $n;MySQL 原样返回。
+	// 核心里所有 SQL 一律只用不复用的位置 ?(同值在 args 里重复传),Rebind 才能保持最简形态。
+	Rebind(query string) string
+
+	// SchemaSQL 返回建表 + 建索引的 DDL(按 prefix 拼表名/索引名),按顺序执行。
+	// 各库类型映射不同(TEXT/VARCHAR、BLOB/BYTEA/LONGBLOB、INTEGER/BIGINT);
+	// MySQL 必须内置 utf8mb4_bin 排序规则(否则自定义 ID "abc"/"ABC" 被判重复、排序契约漂移)。
+	SchemaSQL(prefix string) []string
+
+	// IsDuplicateKey 判定错误是否为主键冲突(Enqueue 撞 ID → 翻译 taskgate.ErrTaskExists)。
+	// PG SQLSTATE 23505 / MySQL errno 1062。实现必须 errors.As 到驱动错误类型再看码,禁止字符串匹配。
+	IsDuplicateKey(err error) bool
+
+	// Retryable 判定事务错误的重试档位(见 RetryClass)。同样 errors.As 禁字符串匹配。
+	Retryable(err error) RetryClass
+
+	// Lock 建表期库级互斥:多进程首启并发跑 DDL,PG 会报 tuple concurrently updated 等脏错。
+	// 锁必须钉在传入的独占连接 conn 上(MySQL GET_LOCK 是会话级,连接池会错位)。
+	Lock(ctx context.Context, conn *sql.Conn, key string) error
+	// Unlock 释放建表锁(同一 conn)。PG advisory 会话结束也会自动释放,MySQL 必须显式 RELEASE_LOCK。
+	Unlock(ctx context.Context, conn *sql.Conn, key string) error
+}

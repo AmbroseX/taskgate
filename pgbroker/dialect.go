@@ -1,0 +1,122 @@
+package pgbroker
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"hash/fnv"
+	"strconv"
+	"strings"
+
+	"github.com/AmbroseX/taskgate/internal/sqlbroker"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+// pgDialect PostgreSQL 方言。实现 sqlbroker.Dialect。
+type pgDialect struct{}
+
+var _ sqlbroker.Dialect = (*pgDialect)(nil)
+
+func (pgDialect) Name() string { return "postgres" }
+
+// Rebind 把核心 SQL 里的位置 ? 依次换成 PG 的 $1..$n。核心 SQL 的字符串字面量里没有 ?,
+// 但仍逐字符扫描、跳过单引号内区域,稳妥起见不误伤。
+func (pgDialect) Rebind(query string) string {
+	var b strings.Builder
+	b.Grow(len(query) + 8)
+	n := 0
+	inQuote := false
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+		switch {
+		case c == '\'':
+			inQuote = !inQuote
+			b.WriteByte(c)
+		case c == '?' && !inQuote:
+			n++
+			b.WriteByte('$')
+			b.WriteString(strconv.Itoa(n))
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// SchemaSQL PG 建表 + 索引:BYTEA 存二进制、BIGINT 存 unix 毫秒、TEXT 存文本;索引名带前缀
+// (PG 索引名在 schema 内全局唯一,裸名会撞车)。时间列由 Go 层传入,不用 NOW()。
+func (pgDialect) SchemaSQL(prefix string) []string {
+	tasks := prefix + "tasks"
+	deps := prefix + "task_deps"
+	return []string{
+		`CREATE TABLE IF NOT EXISTS ` + tasks + ` (
+			id               TEXT PRIMARY KEY,
+			type             TEXT NOT NULL,
+			queue            TEXT NOT NULL,
+			payload          BYTEA,
+			status           TEXT NOT NULL,
+			result           BYTEA,
+			last_error       TEXT NOT NULL DEFAULT '',
+			attempts         BIGINT NOT NULL DEFAULT 0,
+			max_retry        BIGINT NOT NULL DEFAULT 0,
+			lease_lost       BIGINT NOT NULL DEFAULT 0,
+			throttled        BIGINT NOT NULL DEFAULT 0,
+			run_at           BIGINT NOT NULL,
+			depends_on       TEXT NOT NULL DEFAULT '[]',
+			on_parent_fail   TEXT NOT NULL DEFAULT 'fail_fast',
+			pending_parents  BIGINT NOT NULL DEFAULT 0,
+			lease_token      TEXT NOT NULL DEFAULT '',
+			lease_until      BIGINT NOT NULL DEFAULT 0,
+			cancel_requested BIGINT NOT NULL DEFAULT 0,
+			created_at       BIGINT NOT NULL,
+			started_at       BIGINT NOT NULL DEFAULT 0,
+			finished_at      BIGINT NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS ` + prefix + `idx_claim ON ` + tasks + ` (queue, status, run_at)`,
+		`CREATE INDEX IF NOT EXISTS ` + prefix + `idx_status ON ` + tasks + ` (status, lease_until)`,
+		`CREATE TABLE IF NOT EXISTS ` + deps + ` (
+			child_id  TEXT NOT NULL,
+			parent_id TEXT NOT NULL,
+			done      BIGINT NOT NULL DEFAULT 0,
+			PRIMARY KEY (child_id, parent_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS ` + prefix + `idx_deps_parent ON ` + deps + ` (parent_id, done)`,
+	}
+}
+
+// IsDuplicateKey PG 主键冲突 SQLSTATE 23505。errors.As 到驱动错误类型再看码,禁字符串匹配。
+func (pgDialect) IsDuplicateKey(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// Retryable PG 死锁 40P01 / 序列化失败 40001 都是数据库立即返回,可立即重试。
+func (pgDialect) Retryable(err error) sqlbroker.RetryClass {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "40P01", "40001": // deadlock_detected / serialization_failure
+			return sqlbroker.RetryImmediate
+		}
+	}
+	return sqlbroker.NotRetryable
+}
+
+// Lock/Unlock 建表期库级互斥:pg_advisory_lock 是会话级,钉在传入的独占连接上;
+// key 字符串 hash 成 bigint 传给 advisory 锁。
+func (pgDialect) Lock(ctx context.Context, conn *sql.Conn, key string) error {
+	_, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, advisoryKey(key))
+	return err
+}
+
+func (pgDialect) Unlock(ctx context.Context, conn *sql.Conn, key string) error {
+	_, err := conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, advisoryKey(key))
+	return err
+}
+
+// advisoryKey 把前缀字符串 hash 成一个稳定的 int64,给 pg_advisory_lock 当锁号。
+func advisoryKey(key string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("taskgate:" + key))
+	return int64(h.Sum64())
+}
