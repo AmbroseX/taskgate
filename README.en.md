@@ -1,8 +1,10 @@
 # taskgate
 
-[![PkgGoDev](https://pkg.go.dev/badge/github.com/ambrose/taskgate)](https://pkg.go.dev/github.com/ambrose/taskgate)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ambrose/taskgate)](https://goreportcard.com/report/github.com/ambrose/taskgate)
+[![CI](https://github.com/AmbroseX/taskgate/actions/workflows/ci.yml/badge.svg)](https://github.com/AmbroseX/taskgate/actions/workflows/ci.yml)
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/AmbroseX/taskgate)](https://pkg.go.dev/github.com/AmbroseX/taskgate)
+[![Go Report Card](https://goreportcard.com/badge/github.com/AmbroseX/taskgate)](https://goreportcard.com/report/github.com/AmbroseX/taskgate)
 ![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 English | [简体中文](README.md)
 
@@ -45,7 +47,7 @@ go mod init github.com/my/repo
 Then install taskgate:
 
 ```bash
-go get github.com/ambrose/taskgate
+go get github.com/AmbroseX/taskgate
 ```
 
 Runtime deps: `modernc.org/sqlite` (pure Go), `golang.org/x/time/rate`, `github.com/oklog/ulid/v2`, `github.com/redis/go-redis/v9`, `github.com/go-redis/redis_rate/v10`; test dep: `github.com/alicebob/miniredis/v2`.
@@ -62,8 +64,8 @@ import (
     "encoding/json"
     "time"
 
-    "github.com/ambrose/taskgate"
-    "github.com/ambrose/taskgate/memorybroker"
+    "github.com/AmbroseX/taskgate"
+    "github.com/AmbroseX/taskgate/memorybroker"
 )
 
 func main() {
