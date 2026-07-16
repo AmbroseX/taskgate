@@ -31,3 +31,6 @@ __pycache__/
 
 docs/internal
 review.md
+
+# 外部项目源码副本,仅供本地调研参考
+ref/

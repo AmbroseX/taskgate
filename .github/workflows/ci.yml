@@ -62,3 +62,59 @@ jobs:
         env:
           TASKGATE_REDIS_ADDR: 127.0.0.1:6379
         run: go test -race -count=1 ./redisbroker/...
+
+  # 真 PostgreSQL 档:起一个 postgres 服务,跑 pgbroker 的 18 条契约 + L3 集成 + 并发 propagate 压测。
+  # PG/MySQL 本地无纯 Go 替身,本地 go test 全绿只代表 skip 生效,回归唯一防线就是这两个 job(宪法 V.5)。
+  test-pg:
+    name: test (real postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: go test（真 PG 契约档 + L3 + 并发压测）
+        env:
+          TASKGATE_PG_DSN: postgres://postgres:pass@127.0.0.1:5432/postgres?sslmode=disable
+        run: go test -race -count=1 ./pgbroker/... .
+
+  # 真 MySQL 档:起一个 mysql 8 服务,跑 mysqlbroker 的 18 条契约 + L3 集成 + 并发 propagate 压测。
+  test-mysql:
+    name: test (real mysql)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: pass
+          MYSQL_DATABASE: taskgate
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ppass"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: go test（真 MySQL 契约档 + L3 + 并发压测）
+        env:
+          TASKGATE_MYSQL_DSN: root:pass@tcp(127.0.0.1:3306)/taskgate
+        run: go test -race -count=1 ./mysqlbroker/... .
