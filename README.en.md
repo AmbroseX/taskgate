@@ -50,8 +50,11 @@ go mod init github.com/my/repo
 Then install taskgate:
 
 ```bash
-go get github.com/AmbroseX/taskgate
+go get github.com/AmbroseX/taskgate@latest   # latest release
+go get github.com/AmbroseX/taskgate@v0.1.0   # pin a specific version
 ```
+
+Versioning follows [SemVer](https://semver.org/). The project is currently at **v0 — the API is not frozen**, so minor releases may include breaking changes; check the [release notes](https://github.com/AmbroseX/taskgate/releases) before upgrading. Your dependency is pinned in your own `go.mod` + `go.sum`, so new releases won't affect you until you run `go get -u`.
 
 Runtime deps: `modernc.org/sqlite` (pure Go), `golang.org/x/time/rate`, `github.com/oklog/ulid/v2`, `github.com/redis/go-redis/v9`, `github.com/go-redis/redis_rate/v10`, `github.com/jackc/pgx/v5` (pure Go, no cgo), `github.com/go-sql-driver/mysql` (pure Go, no cgo); test dep: `github.com/alicebob/miniredis/v2`.
 

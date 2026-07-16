@@ -50,8 +50,11 @@ go mod init github.com/my/repo
 再拉取 taskgate:
 
 ```bash
-go get github.com/AmbroseX/taskgate
+go get github.com/AmbroseX/taskgate@latest   # 最新正式版
+go get github.com/AmbroseX/taskgate@v0.1.0   # 锁定某个版本
 ```
+
+版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。当前处于 **v0 阶段,API 尚未冻结**,小版本(minor)升级可能带来不兼容改动,升级前请看[发布说明](https://github.com/AmbroseX/taskgate/releases)。你的依赖锁在自己的 `go.mod` + `go.sum` 里,不主动 `go get -u` 就不会被新版本影响。
 
 运行期依赖:`modernc.org/sqlite`(纯 Go)、`golang.org/x/time/rate`、`github.com/oklog/ulid/v2`、`github.com/redis/go-redis/v9`、`github.com/go-redis/redis_rate/v10`、`github.com/jackc/pgx/v5`(纯 Go 免 cgo)、`github.com/go-sql-driver/mysql`(纯 Go 免 cgo);测试依赖 `github.com/alicebob/miniredis/v2`。
 
