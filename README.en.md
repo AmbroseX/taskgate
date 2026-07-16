@@ -8,16 +8,16 @@
 
 English | [简体中文](README.md)
 
-taskgate is a `go get`-and-go task queueing & rate-limiting library for Go: queueing, rate limiting, retries, dependencies, cancellation, and graceful shutdown — one interface, three backends.
+taskgate is a `go get`-and-go task queueing & rate-limiting library for Go: queueing, rate limiting, retries, dependencies, cancellation, and graceful shutdown — one interface, five backends.
 
 It is a **library, not a service** — there is no Web UI, it reads no environment variables or config files, it only takes the `Config` you hand it. Typical use case: when calling quota-bound external gateways like LLM / OCR, funnel the requests into a queue, isolate and rate-limit them per type, back off and retry on failure, and reclaim tasks via leases when a process crashes.
 
 ## Features
 
 - **Per-type rate limiting**: each queue has its own `{Workers, RPS, Burst}`, so a slow queue never drags down a fast one; `Routes` lets multiple task types share a queue (and thus share one gateway's quota).
-- **Three backends, one contract**: `memorybroker` (in-memory, zero deps), `sqlitebroker` (single-file on disk, pure Go, no cgo), `redisbroker` (multi-process shared, atomic Lua transitions); all three pass the same behavioral contract (`brokertest`, 18 cases).
+- **Five backends, one contract**: `memorybroker` (in-memory, zero deps), `sqlitebroker` (single-file on disk, pure Go, no cgo), `redisbroker` (multi-process shared, atomic Lua transitions), `pgbroker` (PostgreSQL), `mysqlbroker` (MySQL) — the last two are server-database backends: multi-process shared, exclusive claim via `FOR UPDATE SKIP LOCKED` (requires MySQL 8.0+ / PostgreSQL 9.5+); all five pass the same behavioral contract (`brokertest`, 18 cases).
 - **Distributed rate limiting** (redis backend): a queue's Workers/RPS quota is shared across every process connected to the same Redis, so adding machines doesn't mean hammering the gateway; concurrency slots held by a crashed process are reclaimed by lease.
-- **Lease reclaim**: claiming a task takes a lease, heartbeats renew it automatically; after a worker crash the reaper picks tasks back up to rerun, and poison tasks hit a cap and go to the dead-letter state; long tasks can call `RenewLease` inside the handler, or turn off the auto heartbeat per queue and go fully manual (`ManualHeartbeat`).
+- **Lease reclaim**: claiming a task takes a lease, heartbeats renew it automatically; after a worker crash the reaper picks tasks back up to rerun, and poison tasks hit a cap and go to the dead-letter state; long tasks can call `RenewLease` inside the handler, or turn off the auto heartbeat per queue and go fully manual (`ManualHeartbeat`). **The price is at-least-once — crash reclaim reruns your handler, so it must be idempotent**; see [The handler contract](#the-handler-contract-must-be-idempotent).
 - **Three retry counters, clear division of labor**: `Attempts` handles business failures (exponential backoff `min(2^n×1s, 10min)±20%`, goes to `failed` past `MaxRetry`), `Throttled` handles gateway rate limiting (`ErrThrottled` doesn't consume retry attempts), `LeaseLost` handles crash reclaim; `ErrSkipRetry` goes straight to dead-letter.
 - **Dependency pipelines**: `DependsOn` chains and fans in; the parent's final state and the child's wake-up happen in the same transaction, so no wake-up is lost; a failed parent cascades cancellation by default (opt out with `IgnoreParentFailure`).
 - **Cancellation**: pending/blocked tasks are cancelled directly and propagate downward; a running task's handler ctx is cancelled immediately.
@@ -26,13 +26,15 @@ It is a **library, not a service** — there is no Web UI, it reads no environme
 
 ## Supported backends
 
-All three backends implement the same Broker contract and are verified by the same `brokertest` (18 cases). Switching backends means changing one constructor line — your business code stays untouched. Pick one by deployment shape:
+All five backends implement the same Broker contract and are verified by the same `brokertest` (18 cases). Switching backends means changing one constructor line — your business code stays untouched. Pick one by deployment shape:
 
 | Backend | Fit | Deps | Persistence | Multi-process sharing |
 |---|---|---|---|---|
 | `memorybroker` | single process, tests, ephemeral tasks | none | no (lost on exit) | no |
 | `sqlitebroker` | single machine, needs disk, no cgo | `modernc.org/sqlite` (pure Go) | single file | same-machine multi-process (file lock) |
-| `redisbroker` | multi-process / multi-machine, exactly-once | Redis + go-redis | Redis | yes (atomic Lua transitions) |
+| `redisbroker` | multi-process / multi-machine, exclusive claim | Redis + go-redis | Redis | yes (atomic Lua transitions) |
+| `pgbroker` | multi-process / multi-machine, existing PG database | `github.com/jackc/pgx/v5` (pure Go) | PostgreSQL | yes (FOR UPDATE SKIP LOCKED) |
+| `mysqlbroker` | multi-process / multi-machine, existing MySQL database | `github.com/go-sql-driver/mysql` (pure Go) | MySQL | yes (FOR UPDATE SKIP LOCKED) |
 
 The Redis backend targets single-instance / primary-replica / sentinel topologies. **Redis Cluster is not supported** (keys are built by prefix inside the scripts and carry no hash tag).
 
@@ -50,7 +52,7 @@ Then install taskgate:
 go get github.com/AmbroseX/taskgate
 ```
 
-Runtime deps: `modernc.org/sqlite` (pure Go), `golang.org/x/time/rate`, `github.com/oklog/ulid/v2`, `github.com/redis/go-redis/v9`, `github.com/go-redis/redis_rate/v10`; test dep: `github.com/alicebob/miniredis/v2`.
+Runtime deps: `modernc.org/sqlite` (pure Go), `golang.org/x/time/rate`, `github.com/oklog/ulid/v2`, `github.com/redis/go-redis/v9`, `github.com/go-redis/redis_rate/v10`, `github.com/jackc/pgx/v5` (pure Go, no cgo), `github.com/go-sql-driver/mysql` (pure Go, no cgo); test dep: `github.com/alicebob/miniredis/v2`.
 
 ## Quickstart
 
@@ -108,6 +110,79 @@ func main() {
     _ = g.Shutdown(ctx)
 }
 ```
+
+## The handler contract: must be idempotent
+
+**taskgate is at-least-once, not exactly-once. The same task's handler may run more than once, and your handler must tolerate reruns.**
+
+This isn't something that only happens "when things go wrong" — it's part of normal operation. Three paths lead to a rerun:
+
+| Path | Trigger | Counter |
+|---|---|---|
+| Worker process crash (`kill -9`, OOM, power loss) | heartbeat stops → lease expires → reaper picks the task back up | `LeaseLost` |
+| Handler hangs with `ManualHeartbeat` enabled on the queue | renewal stops → lease expires → reclaimed | `LeaseLost` |
+| `Shutdown(ctx)` times out and interrupts | task is `Requeue`d back to pending as-is | **no counter moves** (the task looks like it never ran) |
+
+For the first two, the crash can happen **halfway through** the first run — the LLM call already went out, the money is already spent, the database may be half-written.
+
+### An example that will bite you
+
+```go
+// ❌ Wrong: a rerun double-deducts quota and double-writes
+g.Handle("summarize", func(ctx context.Context, t *taskgate.Task) ([]byte, error) {
+    resp, err := callLLM(ctx, t.Payload) // ← costs money
+    if err != nil {
+        return nil, err
+    }
+    billing.Deduct(userID, resp.Tokens)  // ← deducts quota
+    return db.Save(ctx, resp)            // ← suppose the process dies here
+})
+```
+
+The process dies inside `db.Save` → the lease expires → the reaper picks it back up and reruns it → **the LLM is called twice and the quota is deducted twice**, while the database holds only one result.
+
+### How to guard: two separate problems
+
+A rerun hurts two different things. **The remedies are different, and taskgate cannot give you a guarantee for the second one:**
+
+| | Local side effects (quota, DB writes, notifications) | External gateway calls (LLM/OCR) |
+|---|---|---|
+| Can it be prevented? | **Yes**, with `Task.ID` as an idempotency key | **Depends on the gateway** — taskgate can't help |
+| How | DB unique constraint / idempotency table / transactional outbox | If the gateway supports idempotency keys, pass `Task.ID`; if not, you must accept duplicate calls |
+
+#### Local side effects: guard atomically with `Task.ID`
+
+`Task.ID` is stable across reruns — use it as your business idempotency key. **The key point is that the deduction and the write must land in one transaction under one unique key** — doing them in two steps leaves a window.
+
+```go
+g.Handle("summarize", func(ctx context.Context, t *taskgate.Task) ([]byte, error) {
+    resp, err := callLLM(ctx, t.Payload)
+    if err != nil {
+        return nil, err
+    }
+    // Deduct + persist in a single transaction keyed by t.ID;
+    // on a rerun the unique constraint conflicts, the first result is returned,
+    // and the user is not charged twice.
+    return db.SaveOnce(ctx, t.ID, userID, resp)
+})
+```
+
+#### External calls: taskgate cannot close this window
+
+The snippet above **does not stop the LLM from being called twice**. If the process dies after `callLLM` succeeds but before `db.SaveOnce`, the rerun will inevitably hit the gateway again — **that call costs money**. What you get is only that the user isn't double-charged and the database isn't double-written.
+
+This window is the inherent price of at-least-once. There are exactly two ways to deal with it:
+
+- **The gateway supports idempotency keys** (OpenAI's `Idempotency-Key`, most payment gateways): pass `t.ID` through and let the gateway deduplicate, so a rerun produces no second charge. **This is the only way to truly eliminate the duplicate call.**
+- **The gateway doesn't**: accept the cost of duplicate calls, or compensate at the business protocol level (reconciliation, dedup by `t.ID`). taskgate can't help here — the "external call already succeeded but nothing landed locally yet" window cannot be closed by any task queue.
+
+> **`WithID` makes *submission* idempotent, not *execution*.** Submitting the same ID twice returns `ErrTaskExists`, so the task is enqueued only once; but once enqueued, that single task's handler can still run multiple times due to crash reclaim. These are two different things — don't conflate them.
+
+> **Do not put critical side effects in `OnStateChange`.** It is an asynchronous notification: no delivery guarantee, no ordering guarantee, a panic in the callback is swallowed, and there is no retry and no "consumed exactly once globally" guarantee. It suits instrumentation and observation that tolerates loss or duplication — it cannot carry billing, notifications, or business-final writes.
+
+### Why we don't do exactly-once
+
+This is the hard problem of distributed systems: a handler's execution and its side effects don't share a transaction, so no library can give you that guarantee — every "mark it done once it finishes" scheme has a window where the work finished but the mark didn't land. What we can give you is at-least-once plus a `Task.ID` that stays stable across reruns, so you can build idempotency on your side.
 
 ## Handler error semantics
 
@@ -173,7 +248,11 @@ Two things to keep in mind:
 
 ## Redis backend (multi-process)
 
-Use it when multiple worker processes connect to the same Redis and race for the same batch of tasks: each task is executed exactly once, and after a `kill -9` running tasks are reclaimed by lease and rerun. Switching backends means changing this one constructor line — everything else stays the same:
+Use it when multiple worker processes connect to the same Redis and race for the same batch of tasks: atomic Lua transitions guarantee that **each task has exactly one valid lease at any instant**, so state transitions are never torn by concurrency; after a `kill -9`, running tasks are reclaimed by lease and **rerun**.
+
+> Note this is not the same as "handlers never overlap": once a lease expires a new worker may re-claim the task, while the old handler may still be running — a network partition, a process pause (STW/paging), or simply not honoring ctx promptly. Two copies of your business code can briefly overlap. So execution is at-least-once and your handler must be idempotent — see [The handler contract](#the-handler-contract-must-be-idempotent).
+
+Switching backends means changing this one constructor line — everything else stays the same:
 
 ```go
 b, err := redisbroker.New(redisbroker.Options{
@@ -198,6 +277,7 @@ Self-healing concurrency slots: each occupied slot records an expiry time (= the
 
 - **A new task noticed by another process**: same-process submissions have an internal wake-up signal and respond immediately; writes from another process are discovered by Dequeue's fallback poll, at worst **≤100ms** (same as sqlite cross-process).
 - **Cross-process Cancel**: a running task's cancel flag is discovered by the holding process on its next heartbeat, so at worst **≤ one heartbeat cycle (LeaseTTL/3)** later its handler ctx is cancelled.
+- **A crashed task picked back up**: counting from the last successful renewal, `LeaseTTL` (lease expiry) plus at worst `LeaseTTL/2` (the reaper scans every `min(LeaseTTL across queues)/2`) = **`LeaseTTL` to `1.5×LeaseTTL`** (60s default → 60–90s) before it returns to pending; after that it still has to queue up, take a slot, and wait for a token before it actually runs. Lower `LeaseTTL` to detect crashes sooner, at the cost of more frequent heartbeats (one every `LeaseTTL/3`).
 
 ### Redis key cheat sheet (for ops)
 
@@ -224,6 +304,30 @@ Default prefix `tg:` (changeable via `Options.KeyPrefix`). No need to go through
 - **Two-tier contract tests**: the miniredis tier runs offline in CI; set `TASKGATE_REDIS_ADDR=127.0.0.1:6379` and the same 18 contract cases run again against real Redis (isolated by random KeyPrefix, cleaned up afterward) to verify Lua script compatibility.
 - **Redis Cluster not supported**: keys are built by prefix inside the scripts and carry no hash tag; targets single-instance / primary-replica / sentinel topologies.
 - **Limiter keys and task keys live in the same Redis instance**: a flushdb-level failure takes both down together (an honest trade-off).
+
+## SQL backends: PostgreSQL / MySQL (multi-process)
+
+Use these when you already run a PostgreSQL or MySQL and don't want to bring in a Redis: multiple worker processes connect to the same database and race for the same batch of tasks, with exclusive claim via `FOR UPDATE SKIP LOCKED` (requires MySQL 8.0+ / PostgreSQL 9.5+), and they pass the same 18 contract cases. Just like redis, switching backends means changing one constructor line — your business code stays untouched:
+
+```go
+import "github.com/AmbroseX/taskgate/pgbroker"
+b, err := pgbroker.Open("postgres://user:pass@localhost:5432/db?sslmode=disable")
+```
+
+```go
+import "github.com/AmbroseX/taskgate/mysqlbroker"
+b, err := mysqlbroker.Open("user:pass@tcp(localhost:3306)/db")
+```
+
+Options: `WithTablePrefix("myapp_")` (default `taskgate_`, use it to isolate when several apps share one database), `WithMaxOpenConns(n)` (default 10), `WithPollInterval(d)` (default 200ms). On the first `Open`, `Init` creates the tables automatically (`CREATE TABLE IF NOT EXISTS`, safe under concurrent cold starts).
+
+### Known limitations
+
+- **Cross-process new-task notice latency = the poll interval** (default 200ms, tunable); there is no PG LISTEN/NOTIFY instant wake-up.
+- **No distributed rate limiting**: the SQL backends don't implement `LimiterProvider`, so the scheduler falls back to in-process limiting and each process limits on its own; for precise cross-process rate limiting use the redis backend.
+- **Under high-concurrency dependency-propagation conflicts**, transactions go through automatic database-deadlock retries (capped, default 5 times), showing up as higher latency on a few calls; once the retry cap is exceeded the deadlock error is thrown as-is.
+- **MySQL-specific**: custom ID/type/queue are at most 255 chars (validated at the `Enqueue` entry point, with a clear error past the limit); payload/result are bounded by the server's `max_allowed_packet` (default 64M); tables use the `utf8mb4_bin` collation (baked into the DDL, so custom IDs are case-sensitive).
+- **Contract tests need a real database** (env-gated by `TASKGATE_PG_DSN` / `TASKGATE_MYSQL_DSN`), skipped when no database is available locally — an all-green local run does not mean these two backends were exercised; regression relies on CI.
 
 ## Config
 
@@ -315,10 +419,12 @@ The whole suite runs offline (L1 unit → L2 brokertest contract → L3 integrat
 go test ./... -race
 ```
 
-To run the 18 contract cases against real Redis as well (optional, verifies Lua script compatibility):
+To run the 18 contract cases against real databases as well (optional; Redis verifies Lua script compatibility, PG/MySQL auto-skip when no database is available locally):
 
 ```bash
 TASKGATE_REDIS_ADDR=127.0.0.1:6379 go test ./redisbroker/... -race
+TASKGATE_PG_DSN="postgres://postgres:pass@localhost:5432/postgres?sslmode=disable" go test ./pgbroker/... -race
+TASKGATE_MYSQL_DSN="root:pass@tcp(localhost:3306)/taskgate" go test ./mysqlbroker/... -race
 ```
 
 ## Test layers and e2e
@@ -343,7 +449,7 @@ LLM_GATEWAY_URL=https://your-gateway LLM_GATEWAY_KEY=secret \
 ## Milestones
 
 - **M1 (done)**: core queueing, rate limiting, retries, dependencies, cancellation, Shutdown; memory / sqlite backends.
-- **M2 (done)**: redis backend (atomic Lua transitions, multi-process exactly-once), distributed rate limiting (quota shared across processes), performance baseline.
+- **M2 (done)**: redis backend (atomic Lua transitions, multi-process exclusive claim), distributed rate limiting (quota shared across processes), performance baseline.
 - **M3 (done)**: L4 simulated E2E (five mockgw fault-injection cases), handler manual renewal (`RenewLease`/`ManualHeartbeat`), List pagination, realgw manual smoke tier.
 
 Explicitly out of scope (YAGNI): task priority, webhook notifications, cursor pagination, Web UI, cron periodic scheduling, DAG workflow engine, standalone server mode.
