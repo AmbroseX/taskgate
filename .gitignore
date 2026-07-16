@@ -28,3 +28,6 @@ __pycache__/
 **/.local/
 **/.venv/
 **/.conda/
+
+docs/internal
+review.md
