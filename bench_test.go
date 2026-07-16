@@ -21,9 +21,9 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/redisbroker"
-	"github.com/ambrose/taskgate/sqlitebroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/redisbroker"
+	"github.com/AmbroseX/taskgate/sqlitebroker"
 )
 
 // benchQueue 基准统一的队列名 = 任务类型名。

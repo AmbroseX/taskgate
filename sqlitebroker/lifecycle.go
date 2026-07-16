@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // Ack 成功完结:completed + Result + FinishedAt,并在同一事务内唤醒子任务。

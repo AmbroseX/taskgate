@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // propagateTx 任务进终态后的依赖传播,必须和触发它的状态写入同处一个事务——

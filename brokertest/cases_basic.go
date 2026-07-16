@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // 契约 1 RoundTrip:入队再 Get,全字段一致;Get 返回副本,改了不影响存储。

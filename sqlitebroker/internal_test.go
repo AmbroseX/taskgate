@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/internal/fakeclock"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/internal/fakeclock"
 )
 
 // newTestBroker 起一个用 fakeclock 的临时库 broker。

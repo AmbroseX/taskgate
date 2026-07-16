@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // 契约 6 AckFail:Ack 写结果;FailBusiness 走 Attempts;FailSkip 直接 failed;

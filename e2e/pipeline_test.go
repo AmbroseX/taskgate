@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/e2e/mockgw"
-	"github.com/ambrose/taskgate/memorybroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/e2e/mockgw"
+	"github.com/AmbroseX/taskgate/memorybroker"
 )
 
 // newGate memory 后端上建 Gate,配置有问题直接挂测试。

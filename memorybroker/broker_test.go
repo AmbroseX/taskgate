@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/brokertest"
-	"github.com/ambrose/taskgate/memorybroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/brokertest"
+	"github.com/AmbroseX/taskgate/memorybroker"
 )
 
 // TestBrokerContract 一行接入统一契约套件:memory 后端必须过全部 18 条契约。

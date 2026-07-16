@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 	"github.com/go-redis/redis_rate/v10"
 	"github.com/oklog/ulid/v2"
 	"github.com/redis/go-redis/v9"

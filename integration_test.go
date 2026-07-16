@@ -15,11 +15,11 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/internal/fakeclock"
-	"github.com/ambrose/taskgate/memorybroker"
-	"github.com/ambrose/taskgate/redisbroker"
-	"github.com/ambrose/taskgate/sqlitebroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/internal/fakeclock"
+	"github.com/AmbroseX/taskgate/memorybroker"
+	"github.com/AmbroseX/taskgate/redisbroker"
+	"github.com/AmbroseX/taskgate/sqlitebroker"
 )
 
 // backends 三后端参数化:同一个场景在 memory、sqlite、redis(miniredis)上都得绿。

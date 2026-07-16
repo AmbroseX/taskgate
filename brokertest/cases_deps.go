@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // dependsOn 造一个带依赖的任务。

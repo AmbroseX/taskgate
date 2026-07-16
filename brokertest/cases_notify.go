@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // notifyCollector 线程安全的回调收集器。record 记录完快照后故意 panic:

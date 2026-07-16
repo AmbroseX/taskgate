@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 	"github.com/redis/go-redis/v9"
 )
 

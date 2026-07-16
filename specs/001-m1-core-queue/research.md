@@ -96,7 +96,7 @@ RETURNING *;
 
 ## 9. 模块路径
 
-**Decision**: `github.com/ambrose/taskgate`(占位,发布前可改);M1 不发布,仅本地。
+**Decision**: `github.com/AmbroseX/taskgate`(占位,发布前可改);M1 不发布,仅本地。
 
 ## 10. kill -9 崩溃测试的实现
 

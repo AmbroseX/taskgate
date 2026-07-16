@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 	"github.com/oklog/ulid/v2"
 )
 

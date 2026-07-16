@@ -4,7 +4,7 @@
 
 - Go ≥ 1.25;无需 Redis、无需 cgo
 - 依赖只允许:`modernc.org/sqlite`、`golang.org/x/time/rate`、`github.com/oklog/ulid/v2`
-- 初始化:`go mod init github.com/ambrose/taskgate`
+- 初始化:`go mod init github.com/AmbroseX/taskgate`
 
 ## 开发顺序(严格按此推进,每步 go build ./... 通过再走下一步)
 

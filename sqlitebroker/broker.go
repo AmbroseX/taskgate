@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 	_ "modernc.org/sqlite" // database/sql 驱动,驱动名 "sqlite"
 )
 

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AmbroseX/taskgate"
 	"github.com/alicebob/miniredis/v2"
-	"github.com/ambrose/taskgate"
 )
 
 // TestCloseStopsRenewGoroutines 占槽后不 ReleaseSlot、直接 Broker.Close:

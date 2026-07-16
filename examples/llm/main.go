@@ -15,8 +15,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/memorybroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/memorybroker"
 )
 
 func main() {

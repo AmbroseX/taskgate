@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/brokertest"
+	"github.com/AmbroseX/taskgate/redisbroker"
 	"github.com/alicebob/miniredis/v2"
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/brokertest"
-	"github.com/ambrose/taskgate/redisbroker"
 	"github.com/oklog/ulid/v2"
 	"github.com/redis/go-redis/v9"
 )

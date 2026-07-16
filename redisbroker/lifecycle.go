@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // runFinish 五个写终点共用的执行器:跑 finish.lua(op 区分语义),

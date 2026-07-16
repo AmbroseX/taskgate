@@ -31,8 +31,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/sqlitebroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/sqlitebroker"
 )
 
 // chatRequest OpenAI 兼容的 chat/completions 请求体(只带用得上的字段)。

@@ -1,4 +1,4 @@
-module github.com/ambrose/taskgate
+module github.com/AmbroseX/taskgate
 
 go 1.25.0
 

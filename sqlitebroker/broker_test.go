@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/brokertest"
-	"github.com/ambrose/taskgate/sqlitebroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/brokertest"
+	"github.com/AmbroseX/taskgate/sqlitebroker"
 )
 
 // TestBrokerContract 一行接入统一契约套件:sqlite 后端必须过全部 18 条契约。

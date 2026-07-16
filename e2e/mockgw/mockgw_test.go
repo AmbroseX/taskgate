@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate/e2e/mockgw"
+	"github.com/AmbroseX/taskgate/e2e/mockgw"
 )
 
 // fetch 打一次网关,返回状态码和 body 文本;网络层错误(断连)原样返回。

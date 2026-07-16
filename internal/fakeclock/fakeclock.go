@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // Clock 实现 taskgate.Clock。并发安全,所有等待者靠 Advance 手动唤醒。

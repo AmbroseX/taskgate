@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // 契约 13 CountsConsistency:铺满七种状态后,Counts 必须与逐个 Get(经 List)汇总一致;

@@ -8,7 +8,7 @@
 
 ## Technical Context
 
-**Language/Version**: Go 1.25(本机 go1.25.0,go.mod 尚未初始化,`go mod init github.com/ambrose/taskgate`)
+**Language/Version**: Go 1.25(本机 go1.25.0,go.mod 尚未初始化,`go mod init github.com/AmbroseX/taskgate`)
 **Primary Dependencies**: modernc.org/sqlite(纯 Go)、golang.org/x/time/rate、github.com/oklog/ulid/v2;仅此三个,M1 不引 redis
 **Affected Backends**: memory + sqlite(M1 全部);Broker 接口一次定型,M2 的 redis 不改签名
 **Testing**: L1(limiter/退避/校验/状态机/依赖计数)+ L2(brokertest,memory/sqlite 双后端)+ L3(integration_test.go 全场景)+ 专项(kill -9 崩溃恢复、唤醒中途崩)
@@ -49,7 +49,7 @@ specs/001-m1-core-queue/
 
 ```text
 taskgate/
-├── go.mod                    # module github.com/ambrose/taskgate
+├── go.mod                    # module github.com/AmbroseX/taskgate
 ├── taskgate.go               # Task/Status/哨兵错误/提交选项/Config/QueueConfig/Duration
 ├── errors.go                 # ErrTaskExists/ErrLeaseLost/ErrThrottled/ErrSkipRetry/ErrTaskNotFound...
 ├── broker.go                 # Broker 接口 + Filter

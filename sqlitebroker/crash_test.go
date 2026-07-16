@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/sqlitebroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/sqlitebroker"
 )
 
 // crashQueue 崩溃用例统一的队列配置:短租约让恢复快(1s),Workers 1 保证时序单纯。

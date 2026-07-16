@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/internal/fakeclock"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/internal/fakeclock"
 )
 
 // Factory 由各后端的测试文件提供:用给定选项构造一个**已 Init**的空 broker。

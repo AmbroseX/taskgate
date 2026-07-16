@@ -33,8 +33,8 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/redisbroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/redisbroker"
 )
 
 // 多进程专项的公共约定:任务类型 = 队列名 = "mp";

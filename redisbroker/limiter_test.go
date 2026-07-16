@@ -14,9 +14,9 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/ambrose/taskgate"
-	"github.com/ambrose/taskgate/internal/fakeclock"
-	"github.com/ambrose/taskgate/redisbroker"
+	"github.com/AmbroseX/taskgate"
+	"github.com/AmbroseX/taskgate/internal/fakeclock"
+	"github.com/AmbroseX/taskgate/redisbroker"
 )
 
 // newLimiterBroker 在指定 miniredis 上建一个已 Init 的 Broker(模拟一个进程)。

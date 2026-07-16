@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/ambrose/taskgate"
+	"github.com/AmbroseX/taskgate"
 )
 
 // Get 取单个任务。scanRec 扫出来的就是全新副本,调用方改了不影响存储。
